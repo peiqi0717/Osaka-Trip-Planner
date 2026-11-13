@@ -41,11 +41,28 @@ PACK_CAT_OPTIONS = ["重要證件/錢包", "3C電子/網路", "衣物穿搭", "�
 WEEKDAY_ZH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
 
 CAT_COLOR_RGBA = {
-    "美食": [255, 87, 51, 220],         # 橘紅色
-    "購物": [155, 89, 182, 220],        # 亮紫色
-    "景點與地標": [39, 174, 96, 220],   # 翠綠色
-    "交通/住宿": [41, 128, 185, 220],   # 寶藍色
-    "未分類": [127, 140, 141, 220]      # 鐵灰色
+    "美食": [255, 87, 51, 235],         # 橘紅色
+    "購物": [155, 89, 182, 235],        # 亮紫色
+    "景點與地標": [39, 174, 96, 235],   # 翠綠色
+    "交通/住宿": [41, 128, 185, 235],   # 寶藍色
+    "未分類": [127, 140, 141, 235]      # 鐵灰色
+}
+
+# 內建 SVG 向量地圖圖釘圖示（無需外部圖檔即可渲染清晰圖釘）
+PIN_SVG = """
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <path d="M32 4C19.85 4 10 13.85 10 26C10 42.5 32 60 32 60C32 60 54 42.5 54 26C54 13.85 44.15 4 32 4Z" fill="white" stroke="#2c3e50" stroke-width="3"/>
+  <circle cx="32" cy="25" r="8" fill="#2c3e50"/>
+</svg>
+"""
+PIN_ICON_URL = "data:image/svg+xml;charset=utf-8," + urllib.parse.quote(PIN_SVG.strip())
+
+PIN_ICON_SPEC = {
+    "url": PIN_ICON_URL,
+    "width": 64,
+    "height": 64,
+    "anchorY": 60,
+    "mask": True  # 自動套用各分類的顏色
 }
 
 DEFAULT_PACKING_TEMPLATE = [
@@ -80,6 +97,38 @@ BRANCH_INDICATORS = [
     "淀屋橋", "本町", "堀江", "美國村", "環球", "天保山", "海遊館", "大阪城",
     "勝尾寺", "箕面", "京都", "神戶", "奈良", "堺", "吹田", "枚方", "高槻", "臨空", "桜塚"
 ]
+
+def build_map_marker_layer(df_points, marker_style, is_day_route=False):
+    """根據使用者選擇產生『精緻小圓點』或『📍 經典地圖圖釘』圖層"""
+    if marker_style.startswith("📍"):
+        df_icon = df_points.copy()
+        df_icon["icon_data"] = [PIN_ICON_SPEC] * len(df_icon)
+        return pdk.Layer(
+            "IconLayer",
+            data=df_icon,
+            get_icon="icon_data",
+            get_position="[lon, lat]",
+            get_color="color",
+            get_size=30 if is_day_route else 26,
+            size_scale=1,
+            size_min_pixels=20,
+            size_max_pixels=36,
+            pickable=True,
+        )
+    else:
+        return pdk.Layer(
+            "ScatterplotLayer",
+            data=df_points,
+            get_position="[lon, lat]",
+            get_fill_color="color",
+            get_line_color=[255, 255, 255, 255],
+            line_width_min_pixels=1.5,
+            stroked=True,
+            get_radius=45 if is_day_route else 35,
+            radius_min_pixels=6 if is_day_route else 5,
+            radius_max_pixels=12 if is_day_route else 10,
+            pickable=True,
+        )
 
 # ==========================================
 # 2. 即時日幣匯率抓取工具（每 30 分鐘自動更新）
@@ -993,7 +1042,7 @@ if st.session_state["workspace_area"] is None:
             st.write("所有同行夥伴共同編輯與查詢的旅遊大本營：")
             st.markdown("""
             * 📅 **每日行程排程器 ＆ AI 顧問**：日曆排程、相鄰景點距離自動提示、AI 路線健檢
-            * 🗺️ **全景點互動地圖總覽**：可縮放地圖檢視所有美食/景點分佈與單日動線連線
+            * 🗺️ **全景點互動地圖總覽**：支援小圓點 / 地圖圖釘切換，檢視所有景點分佈與單日動線
             * 📋 **共用旅遊清單**：瀏覽所有美食、購物、景點與最近車站
             * 🧭 **路線與距離試算**：飯店/機場雙向路線、任意兩定點對比
             * 💰 **共同支出＆分帳計算機**：記錄代墊款項，即時匯率合併結算誰給誰錢
@@ -1071,7 +1120,6 @@ if st.session_state["workspace_area"] == "shared":
         "📊 匯出精美 Excel"
     ])
 
-    # 共用讀取每日行程與日期設定（供排程分頁、地圖分頁與 Excel 匯出使用）
     saved_start, saved_end = load_trip_dates()
     ws_itin = get_or_create_ws("每日行程", ITINERARY_COLS)
     df_itin = load_sheet_df(ws_itin, ITINERARY_COLS)
@@ -1116,7 +1164,6 @@ if st.session_state["workspace_area"] == "shared":
             day_options.append(full_label)
             day_date_map[full_label] = (day_tag, f"{cur_d.strftime('%Y-%m-%d')} ({w_str})")
 
-        # 步驟 2：快速加入行程項目（含未排入篩選）
         with st.container(border=True):
             st.markdown("**步驟 2️⃣：將景點或活動排入行程**")
             opt_c1, opt_c2 = st.columns([3, 2])
@@ -1220,7 +1267,6 @@ if st.session_state["workspace_area"] == "shared":
 
         st.divider()
 
-        # 步驟 3：行程呈現（時間軸模式 vs 表格模式自由切換）
         view_c1, view_c2 = st.columns([2.2, 1.8])
         with view_c1:
             view_mode = st.radio(
@@ -1245,12 +1291,10 @@ if st.session_state["workspace_area"] == "shared":
             else:
                 df_show_itin = df_itin_sorted.copy()
 
-            # 模式 1：⏳ 時間軸卡片模式（自動計算每一站到下一站的距離與步行/搭車時間）
             if view_mode.startswith("⏳"):
                 if df_show_itin.empty:
                     st.info(f"「{filter_day_choice}」目前還沒有安排任何行程喔！")
                 else:
-                    # 建立共用清單名稱與區域/備註對照表，加快座標解析
                     link_meta_map = {}
                     for _, lr in df_links.iterrows():
                         l_name = str(lr["自訂名稱"]).strip() or str(lr["自動抓取標題"]).strip()
@@ -1326,7 +1370,6 @@ if st.session_state["workspace_area"] == "shared":
                                         save_sheet_df(ws_itin, df_itin, ITINERARY_COLS)
                                         st.rerun()
 
-                            # 自動在兩站之間顯示距離與預估移動時間提示條
                             if pos_i < len(group_items) - 1:
                                 lat1, lon1, lines1 = resolved_coords_list[pos_i]
                                 lat2, lon2, lines2 = resolved_coords_list[pos_i + 1]
@@ -1350,7 +1393,6 @@ if st.session_state["workspace_area"] == "shared":
                                         unsafe_allow_html=True
                                     )
 
-            # 模式 2：📊 總覽表格模式
             else:
                 table_df = df_show_itin[["天數", "日期", "時間", "行程名稱", "分類", "最近車站", "備註", "網址", "排程者"]].copy()
                 st.dataframe(
@@ -1376,7 +1418,6 @@ if st.session_state["workspace_area"] == "shared":
 
         st.divider()
 
-        # 步驟 4：🤖 AI 旅遊規劃小助手
         with st.container(border=True):
             st.subheader("🤖 AI 旅遊規劃小助手（行程健檢 ＆ 交通顧問）")
             has_gemini = bool(st.secrets.get("gemini_api_key", "").strip())
@@ -1427,16 +1468,27 @@ if st.session_state["workspace_area"] == "shared":
     # --- 共用分頁 1：🗺️ 全景點 ＆ 每日行程互動地圖總覽 ---
     with tab_map:
         st.subheader("🗺️ 全景點 ＆ 每日動線互動地圖總覽")
-        st.caption("🔴 美食 ｜ 🟣 購物 ｜ 🟢 景點與地標 ｜ 🔵 交通/住宿（滑鼠移到圓點上或手機點擊可查看店名與車站資訊）")
+        st.caption("🔴 美食 ｜ 🟣 購物 ｜ 🟢 景點與地標 ｜ 🔵 交通/住宿（滑鼠移到標記上或手機點擊可查看店名與車站資訊）")
 
-        map_mode = st.radio(
-            "選擇地圖顯示模式：",
-            [
-                "🌍 全部收藏景點總覽（一眼看清所有美食/購物分佈聚落）",
-                "🗓️ 單日行程動線連線模式（用路線連起當天的每一站）"
-            ],
-            horizontal=True
-        )
+        ctrl_m1, ctrl_m2 = st.columns([3, 2])
+        with ctrl_m1:
+            map_mode = st.radio(
+                "選擇地圖顯示模式：",
+                [
+                    "🌍 全部收藏景點總覽（看清所有美食/購物聚落）",
+                    "🗓️ 單日行程動線連線模式（用路線連起當天每一站）"
+                ],
+                horizontal=True
+            )
+        with ctrl_m2:
+            marker_style = st.radio(
+                "選擇標記樣式：",
+                [
+                    "● 精緻小圓點（清爽不遮路）",
+                    "📍 經典地圖圖釘"
+                ],
+                horizontal=True
+            )
 
         # 模式 A：全部收藏景點總覽
         if map_mode.startswith("🌍"):
@@ -1471,7 +1523,7 @@ if st.session_state["workspace_area"] == "shared":
                                 "note": s_note if s_note else "無備註",
                                 "lat": lat_v,
                                 "lon": lon_v,
-                                "color": CAT_COLOR_RGBA.get(s_cat, [127, 140, 141, 220])
+                                "color": CAT_COLOR_RGBA.get(s_cat, [127, 140, 141, 235])
                             })
                         else:
                             unmapped_names.append(s_name)
@@ -1483,24 +1535,12 @@ if st.session_state["workspace_area"] == "shared":
                     center_lat = float(df_pts["lat"].mean())
                     center_lon = float(df_pts["lon"].mean())
 
-                    scatter_layer = pdk.Layer(
-                        "ScatterplotLayer",
-                        data=df_pts,
-                        get_position="[lon, lat]",
-                        get_fill_color="color",
-                        get_line_color=[255, 255, 255, 255],
-                        line_width_min_pixels=2,
-                        stroked=True,
-                        get_radius=130,
-                        radius_min_pixels=8,
-                        radius_max_pixels=22,
-                        pickable=True,
-                    )
+                    marker_layer = build_map_marker_layer(df_pts, marker_style, is_day_route=False)
 
                     view_state = pdk.ViewState(
                         latitude=center_lat,
                         longitude=center_lon,
-                        zoom=12.2,
+                        zoom=12.4,
                         pitch=0
                     )
 
@@ -1510,7 +1550,7 @@ if st.session_state["workspace_area"] == "shared":
                     }
 
                     st.pydeck_chart(pdk.Deck(
-                        layers=[scatter_layer],
+                        layers=[marker_layer],
                         initial_view_state=view_state,
                         tooltip=tooltip,
                         map_style="https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
@@ -1554,7 +1594,7 @@ if st.session_state["workspace_area"] == "shared":
                                 "note": str(r["備註"]).strip() or "無備註",
                                 "lat": lat_v,
                                 "lon": lon_v,
-                                "color": CAT_COLOR_RGBA.get(str(r["分類"]).strip(), [230, 126, 34, 230])
+                                "color": CAT_COLOR_RGBA.get(str(r["分類"]).strip(), [230, 126, 34, 235])
                             })
 
                 if not day_pts:
@@ -1563,7 +1603,6 @@ if st.session_state["workspace_area"] == "shared":
                     df_day_pts = pd.DataFrame(day_pts)
                     layers = []
 
-                    # 若有 2 個以上定點，繪製動線連線
                     if len(day_pts) >= 2:
                         path_coords = [[p["lon"], p["lat"]] for p in day_pts]
                         path_df = pd.DataFrame([{"path": path_coords}])
@@ -1573,29 +1612,17 @@ if st.session_state["workspace_area"] == "shared":
                             get_path="path",
                             get_color=[230, 126, 34, 210],
                             width_scale=1,
-                            width_min_pixels=4,
+                            width_min_pixels=3,
                         )
                         layers.append(path_layer)
 
-                    pts_layer = pdk.Layer(
-                        "ScatterplotLayer",
-                        data=df_day_pts,
-                        get_position="[lon, lat]",
-                        get_fill_color="color",
-                        get_line_color=[255, 255, 255, 255],
-                        line_width_min_pixels=2,
-                        stroked=True,
-                        get_radius=140,
-                        radius_min_pixels=10,
-                        radius_max_pixels=24,
-                        pickable=True,
-                    )
+                    pts_layer = build_map_marker_layer(df_day_pts, marker_style, is_day_route=True)
                     layers.append(pts_layer)
 
                     view_state_day = pdk.ViewState(
                         latitude=float(df_day_pts["lat"].mean()),
                         longitude=float(df_day_pts["lon"].mean()),
-                        zoom=12.5,
+                        zoom=12.7,
                         pitch=0
                     )
 
@@ -1611,7 +1638,6 @@ if st.session_state["workspace_area"] == "shared":
                         map_style="https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
                     ))
 
-                    # 在地圖下方列出當日各站距離摘要表
                     if len(day_pts) >= 2:
                         st.markdown(f"#### 📏 {chosen_map_day} 各站移動距離一覽")
                         seg_rows = []
