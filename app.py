@@ -70,7 +70,46 @@ BRANCH_INDICATORS = [
 ]
 
 # ==========================================
-# 2. 連接 Google 試算表 (多分頁永久資料庫)
+# 2. 即時日幣匯率抓取工具（每 30 分鐘自動更新）
+# ==========================================
+@st.cache_data(ttl=1800)
+def fetch_live_jpy_to_twd():
+    """
+    從免費即時匯率 API 抓取最新 1 JPY = ? TWD 匯率（含雙重備援）。
+    回傳: (rate_float, status_text, is_live_bool)
+    """
+    tw_tz = timezone(timedelta(hours=8))
+    now_str = datetime.datetime.now(tw_tz).strftime("%H:%M")
+
+    # 來源 1：ExchangeRate-API 開放端點（免金鑰、即時更新）
+    try:
+        res = requests.get("https://open.er-api.com/v6/latest/JPY", timeout=4)
+        data = res.json()
+        if data.get("result") == "success":
+            twd_rate = float(data["rates"]["TWD"])
+            if 0.10 <= twd_rate <= 0.50:
+                return round(twd_rate, 4), f"🌐 即時市場匯率（{now_str} 更新）", True
+    except Exception:
+        pass
+
+    # 來源 2：FawazAhmed 免費貨幣 CDN 備援
+    try:
+        res = requests.get(
+            "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/jpy.json",
+            timeout=4
+        )
+        data = res.json()
+        twd_rate = float(data["jpy"]["twd"])
+        if 0.10 <= twd_rate <= 0.50:
+            return round(twd_rate, 4), f"🌐 即時市場匯率（{now_str} 更新）", True
+    except Exception:
+        pass
+
+    # 若網路暫時無法取得，回傳預設參考值
+    return 0.2150, "⚠️ 離線預設參考匯率（可手動調整）", False
+
+# ==========================================
+# 3. 連接 Google 試算表 (多分頁永久資料庫)
 # ==========================================
 @st.cache_resource
 def get_spreadsheet():
@@ -130,7 +169,7 @@ def save_data(df):
     save_sheet_df(ws, df, DEFAULT_COLS)
 
 # ==========================================
-# 3. 帳號驗證與分帳演算法工具
+# 4. 帳號驗證與分帳演算法工具
 # ==========================================
 def hash_pin(nickname, pin_str):
     raw = f"osaka_trip_{nickname.strip()}_{pin_str.strip()}"
@@ -140,11 +179,50 @@ def get_tw_now_str():
     tw_tz = timezone(timedelta(hours=8))
     return datetime.datetime.now(tw_tz).strftime("%Y-%m-%d %H:%M:%S")
 
+def _solve_debt_graph(paid_map, owed_map):
+    all_people = sorted(list(set(list(paid_map.keys()) + list(owed_map.keys()))))
+    summary_rows = []
+    debtors = []
+    creditors = []
+
+    for person in all_people:
+        paid = paid_map.get(person, 0.0)
+        owed = owed_map.get(person, 0.0)
+        net = paid - owed
+        summary_rows.append({
+            "成員": person,
+            "實際先墊金額": round(paid, 1),
+            "個人應分攤金額": round(owed, 1),
+            "淨收支 (+應收 / -應付)": round(net, 1)
+        })
+        if net < -0.5:
+            debtors.append([person, -net])
+        elif net > 0.5:
+            creditors.append([person, net])
+
+    debtors.sort(key=lambda x: x[1], reverse=True)
+    creditors.sort(key=lambda x: x[1], reverse=True)
+
+    transfers = []
+    i, j = 0, 0
+    while i < len(debtors) and j < len(creditors):
+        d_name, d_amt = debtors[i]
+        c_name, c_amt = creditors[j]
+        pay_amt = min(d_amt, c_amt)
+        if pay_amt >= 1:
+            transfers.append((d_name, c_name, round(pay_amt)))
+
+        debtors[i][1] -= pay_amt
+        creditors[j][1] -= pay_amt
+        if debtors[i][1] < 0.5:
+            i += 1
+        if creditors[j][1] < 0.5:
+            j += 1
+
+    return pd.DataFrame(summary_rows), transfers
+
 def calculate_settlements(df_exp, currency):
-    """
-    針對指定幣別計算每個人：先墊總額、應分攤總額、淨差額，
-    並使用貪婪演算法產生「最少轉帳次數」的還款建議清單。
-    """
+    """針對單一幣別計算結算與最少轉帳建議"""
     sub = df_exp[df_exp["幣別"] == currency].copy()
     if sub.empty:
         return pd.DataFrame(), []
@@ -170,50 +248,41 @@ def calculate_settlements(df_exp, currency):
         for p in participants:
             owed_map[p] = owed_map.get(p, 0.0) + share
 
-    all_people = sorted(list(set(list(paid_map.keys()) + list(owed_map.keys()))))
-    summary_rows = []
-    debtors = []   # 欠錢的人 (net < 0)
-    creditors = [] # 該收錢的人 (net > 0)
+    return _solve_debt_graph(paid_map, owed_map)
 
-    for person in all_people:
-        paid = paid_map.get(person, 0.0)
-        owed = owed_map.get(person, 0.0)
-        net = paid - owed
-        summary_rows.append({
-            "成員": person,
-            "實際先墊金額": round(paid, 1),
-            "個人應分攤金額": round(owed, 1),
-            "淨收支 (+應收 / -應付)": round(net, 1)
-        })
-        if net < -0.5:
-            debtors.append([person, -net])
-        elif net > 0.5:
-            creditors.append([person, net])
+def calculate_combined_twd_settlements(df_exp, jpy_to_twd_rate):
+    """將日幣支出即時換算成台幣，與台幣支出合併計算最終台幣結清方式"""
+    if df_exp.empty:
+        return pd.DataFrame(), []
 
-    # 貪婪演算法配對最少轉帳筆數
-    debtors.sort(key=lambda x: x[1], reverse=True)
-    creditors.sort(key=lambda x: x[1], reverse=True)
+    paid_map = {}
+    owed_map = {}
 
-    transfers = []
-    i, j = 0, 0
-    while i < len(debtors) and j < len(creditors):
-        d_name, d_amt = debtors[i]
-        c_name, c_amt = creditors[j]
-        pay_amt = min(d_amt, c_amt)
-        if pay_amt >= 1:
-            transfers.append((d_name, c_name, round(pay_amt)))
+    for _, row in df_exp.iterrows():
+        try:
+            amt = float(row["金額"])
+        except Exception:
+            continue
+        if amt <= 0:
+            continue
 
-        debtors[i][1] -= pay_amt
-        creditors[j][1] -= pay_amt
-        if debtors[i][1] < 0.5:
-            i += 1
-        if creditors[j][1] < 0.5:
-            j += 1
+        curr = str(row["幣別"]).strip()
+        amt_twd = amt * jpy_to_twd_rate if curr == "JPY" else amt
 
-    return pd.DataFrame(summary_rows), transfers
+        payer = str(row["付款人"]).strip()
+        participants = [p.strip() for p in str(row["分攤成員"]).split(",") if p.strip()]
+        if not participants:
+            participants = [payer]
+
+        paid_map[payer] = paid_map.get(payer, 0.0) + amt_twd
+        share = amt_twd / len(participants)
+        for p in participants:
+            owed_map[p] = owed_map.get(p, 0.0) + share
+
+    return _solve_debt_graph(paid_map, owed_map)
 
 # ==========================================
-# 4. Google Places API (New) 座標與全鐵道解析
+# 5. Google Places API (New) 座標與全鐵道解析
 # ==========================================
 def is_google_maps_url(url):
     return any(domain in url.lower() for domain in [
@@ -564,7 +633,7 @@ def build_route_comparison_row(orig_obj, dest_obj):
     }
 
 # ==========================================
-# 5. 產生美化 Excel 報表
+# 6. 產生美化 Excel 報表
 # ==========================================
 def generate_styled_excel(df_links):
     all_list = []
@@ -747,14 +816,13 @@ def generate_styled_excel(df_links):
     return output
 
 # ==========================================
-# 6. 頁面狀態與三層式導覽路由
+# 7. 頁面狀態與三層式導覽路由
 # ==========================================
 if "auth_user" not in st.session_state:
     st.session_state["auth_user"] = None
 if "workspace_area" not in st.session_state:
-    st.session_state["workspace_area"] = None  # None (選擇大廳) / "shared" (共用區) / "private" (私人區)
+    st.session_state["workspace_area"] = None
 
-# 檢查試算表連線
 try:
     _ = get_spreadsheet()
 except Exception as e:
@@ -813,7 +881,6 @@ if not st.session_state["auth_user"]:
                                 st.rerun()
     st.stop()
 
-# 已登入的使用者資訊
 current_user = st.session_state["auth_user"]
 
 # ==============================================================================
@@ -841,7 +908,7 @@ if st.session_state["workspace_area"] is None:
             * 📋 **共用旅遊清單**：瀏覽所有美食、購物、景點與最近車站
             * 🧭 **路線與距離試算**：飯店/機場雙向路線、任意兩定點對比
             * ➕ **新增 / ✏️ 修改景點**：自動解析 Google 地圖與鐵道轉乘
-            * 💰 **共同支出記帳＆分帳計算機**：記錄代墊款項，一鍵精算誰給誰錢
+            * 💰 **共同支出＆分帳計算機**：記錄代墊款項，即時匯率合併結算誰給誰錢
             * 📊 **匯出精美 Excel**：自動按區域上色分類下載
             """)
             st.write("")
@@ -855,8 +922,8 @@ if st.session_state["workspace_area"] is None:
             st.write("專屬於你個人的私密筆記，其他夥伴登入後不會看到：")
             st.markdown("""
             * 🛍️ **私人購物＆代購清單**：記錄想買的藥妝、伴手禮、親友代購
-            * 💴 **自動預算＆台幣換算**：勾選「已買到 ✅」，即時統計花費
-            * 🧳 **個人行李打包清單**：一鍵匯入日本自由行必帶清單並勾選確認
+            * 💱 **即時市場匯率換算**：自動抓取最新日幣匯率，勾選「已買到 ✅」即時統計花費
+            * 🧳 **個人行李打包清單**：一鍵匯入日本自由行常用清單並勾選確認
             """)
             st.write("")
             st.write("")
@@ -1343,7 +1410,15 @@ if st.session_state["workspace_area"] == "shared":
     # --- 共用分頁 5：💰 共同支出記帳＆自動分帳計算機 ---
     with tab5:
         st.subheader("💰 共同支出記帳區 ＆ 自動分帳計算機")
-        st.caption("記錄誰先代墊了機票、住宿、門票、餐費或交通費，系統會自動分幣別（日幣 JPY / 台幣 TWD）精算每個人該付或該收多少錢！")
+        live_rate, rate_status, _ = fetch_live_jpy_to_twd()
+
+        rate_bar1, rate_bar2 = st.columns([4, 1])
+        with rate_bar1:
+            st.caption(f"記錄誰先代墊了機票、住宿、門票或餐費 ｜ **{rate_status}：`1 JPY = {live_rate:.4f} TWD`**")
+        with rate_bar2:
+            if st.button("🔄 刷新即時匯率", key="refresh_rate_shared", use_container_width=True):
+                fetch_live_jpy_to_twd.clear()
+                st.rerun()
 
         ws_users = get_or_create_ws("使用者帳號", USER_COLS)
         df_users = load_sheet_df(ws_users, USER_COLS)
@@ -1354,7 +1429,6 @@ if st.session_state["workspace_area"] == "shared":
         ws_exp = get_or_create_ws("共同支出", EXPENSE_COLS)
         df_exp = load_sheet_df(ws_exp, EXPENSE_COLS)
 
-        # 1. 新增一筆共同支出
         with st.container(border=True):
             st.markdown("**➕ 新增一筆共同支出 / 代墊款項**")
             with st.form("add_expense_form", clear_on_submit=True):
@@ -1377,7 +1451,7 @@ if st.session_state["workspace_area"] == "shared":
                         default=registered_members
                     )
                 with ec6:
-                    exp_note = st.text_input("備註（選填）", placeholder="例如：含飲料、刷卡匯率0.215")
+                    exp_note = st.text_input("備註（選填）", placeholder="例如：含飲料、刷卡")
 
                 submit_exp = st.form_submit_button("✅ 記錄這筆支出", type="primary")
                 if submit_exp:
@@ -1404,14 +1478,23 @@ if st.session_state["workspace_area"] == "shared":
                         st.success(f"✅ 已新增支出：{exp_title.strip()}（{curr_code} {int(exp_amt):,}）")
                         st.rerun()
 
-        # 2. 顯示所有帳目明細與刪除功能
         if df_exp.empty:
             st.info("目前還沒有任何共同支出紀錄，第一筆代墊由你開始記錄吧！")
         else:
             st.markdown("### 📜 所有共同支出明細")
-            st.dataframe(df_exp, use_container_width=True, hide_index=True)
+            # 顯示明細時自動附帶「約合台幣」參考欄
+            disp_exp = df_exp.copy()
+            def calc_twd_preview(r):
+                try:
+                    a = float(r["金額"])
+                    if str(r["幣別"]).strip() == "JPY":
+                        return f"約 NT$ {round(a * live_rate):,}"
+                    return f"NT$ {round(a):,}"
+                except Exception:
+                    return "-"
+            disp_exp.insert(4, "約合台幣(即時匯率)", disp_exp.apply(calc_twd_preview, axis=1))
+            st.dataframe(disp_exp, use_container_width=True, hide_index=True)
 
-            # 刪除錯誤帳目
             with st.expander("🗑️ 刪除錯誤的帳目紀錄"):
                 del_exp_opts = [
                     f"[{i}] {r['日期時間']}｜{r['項目名稱']}（{r['幣別']} {r['金額']}，付款：{r['付款人']}）"
@@ -1427,37 +1510,64 @@ if st.session_state["workspace_area"] == "shared":
 
             st.divider()
 
-            # 3. 自動分帳結算區（JPY & TWD 分開結算）
+            # 結算模式選擇：各幣別分開結算 vs 即時匯率合併台幣一次結清
             st.markdown("### 🧮 自動分帳結算結果（誰該給誰多少錢）")
-            settle_col1, settle_col2 = st.columns(2)
+            settle_mode = st.radio(
+                "選擇結算方式：",
+                [
+                    "💱 方式一：依即時匯率合併成【台幣 TWD】一次總結清（最推薦，不用換兩種幣轉帳）",
+                    "💴 方式二：日幣（JPY）與台幣（TWD）分開各自結算"
+                ],
+                horizontal=True
+            )
 
-            with settle_col1:
-                st.markdown("#### 💴 日幣（JPY）結算")
-                jpy_sum_df, jpy_transfers = calculate_settlements(df_exp, "JPY")
-                if jpy_sum_df.empty:
-                    st.caption("尚無日幣支出紀錄")
-                else:
-                    st.dataframe(jpy_sum_df, use_container_width=True, hide_index=True)
-                    if not jpy_transfers:
-                        st.success("🎉 日幣帳目已完全打平，無需互相轉帳！")
+            if settle_mode.startswith("💱"):
+                custom_settle_rate = st.number_input(
+                    "結算採用匯率（預設已自動抓最新市場即時匯率，也可微調成實際換匯/刷卡匯率）：",
+                    min_value=0.1000,
+                    max_value=0.5000,
+                    value=float(live_rate),
+                    step=0.0005,
+                    format="%.4f"
+                )
+                comb_sum_df, comb_transfers = calculate_combined_twd_settlements(df_exp, custom_settle_rate)
+                if not comb_sum_df.empty:
+                    st.dataframe(comb_sum_df, use_container_width=True, hide_index=True)
+                    if not comb_transfers:
+                        st.success("🎉 所有帳目已完全打平，無需互相轉帳！")
                     else:
-                        st.markdown("**👉 日幣轉帳建議（最少轉帳次數）：**")
-                        for debtor, creditor, amt in jpy_transfers:
-                            st.warning(f"💸 **{debtor}** ➔ 轉給 **{creditor}**：**¥ {amt:,} JPY**")
-
-            with settle_col2:
-                st.markdown("#### 💵 台幣（TWD）結算")
-                twd_sum_df, twd_transfers = calculate_settlements(df_exp, "TWD")
-                if twd_sum_df.empty:
-                    st.caption("尚無台幣支出紀錄")
-                else:
-                    st.dataframe(twd_sum_df, use_container_width=True, hide_index=True)
-                    if not twd_transfers:
-                        st.success("🎉 台幣帳目已完全打平，無需互相轉帳！")
-                    else:
-                        st.markdown("**👉 台幣轉帳建議（最少轉帳次數）：**")
-                        for debtor, creditor, amt in twd_transfers:
+                        st.markdown("**👉 最終台幣轉帳建議（最少轉帳次數，直接轉台幣結清即可）：**")
+                        for debtor, creditor, amt in comb_transfers:
                             st.warning(f"💸 **{debtor}** ➔ 轉給 **{creditor}**：**NT$ {amt:,} TWD**")
+            else:
+                settle_col1, settle_col2 = st.columns(2)
+                with settle_col1:
+                    st.markdown("#### 💴 日幣（JPY）結算")
+                    jpy_sum_df, jpy_transfers = calculate_settlements(df_exp, "JPY")
+                    if jpy_sum_df.empty:
+                        st.caption("尚無日幣支出紀錄")
+                    else:
+                        st.dataframe(jpy_sum_df, use_container_width=True, hide_index=True)
+                        if not jpy_transfers:
+                            st.success("🎉 日幣帳目已完全打平，無需互相轉帳！")
+                        else:
+                            st.markdown("**👉 日幣轉帳建議：**")
+                            for debtor, creditor, amt in jpy_transfers:
+                                st.warning(f"💸 **{debtor}** ➔ 轉給 **{creditor}**：**¥ {amt:,} JPY**")
+
+                with settle_col2:
+                    st.markdown("#### 💵 台幣（TWD）結算")
+                    twd_sum_df, twd_transfers = calculate_settlements(df_exp, "TWD")
+                    if twd_sum_df.empty:
+                        st.caption("尚無台幣支出紀錄")
+                    else:
+                        st.dataframe(twd_sum_df, use_container_width=True, hide_index=True)
+                        if not twd_transfers:
+                            st.success("🎉 台幣帳目已完全打平，無需互相轉帳！")
+                        else:
+                            st.markdown("**👉 台幣轉帳建議：**")
+                            for debtor, creditor, amt in twd_transfers:
+                                st.warning(f"💸 **{debtor}** ➔ 轉給 **{creditor}**：**NT$ {amt:,} TWD**")
 
     # --- 共用分頁 6：匯出精美 Excel ---
     with tab6:
@@ -1498,10 +1608,24 @@ else:
         df_shop_all = load_sheet_df(ws_shop, SHOPPING_COLS)
         my_shop = df_shop_all[df_shop_all["擁有者"].str.strip() == current_user].copy()
 
-        # 匯率設定與預算儀表板
-        rate_col, m1, m2, m3 = st.columns([1.2, 1, 1, 1])
+        live_rate, rate_status, _ = fetch_live_jpy_to_twd()
+
+        # 匯率設定（自動帶入即時市場匯率）與預算儀表板
+        rate_col, m1, m2, m3 = st.columns([1.4, 1, 1, 1])
         with rate_col:
-            jpy_rate = st.number_input("💱 參考匯率 (1 日幣 = ? 台幣)", min_value=0.100, max_value=0.500, value=0.215, step=0.005, format="%.3f")
+            jpy_rate = st.number_input(
+                "💱 即時匯率 (1 日幣 = ? 台幣)",
+                min_value=0.1000,
+                max_value=0.5000,
+                value=float(live_rate),
+                step=0.0005,
+                format="%.4f",
+                help="已自動抓取網路最新即時匯率，你也可以手動輸入自己換匯的匯率"
+            )
+            st.caption(f"{rate_status}")
+            if st.button("🔄 更新即時匯率", key="refresh_rate_private"):
+                fetch_live_jpy_to_twd.clear()
+                st.rerun()
 
         total_jpy = 0.0
         bought_jpy = 0.0
@@ -1522,7 +1646,6 @@ else:
             rem_jpy = max(0.0, total_jpy - bought_jpy)
             st.metric("⏳ 尚未購買預算", f"¥ {int(rem_jpy):,}", f"約 NT$ {int(rem_jpy * jpy_rate):,}")
 
-        # 新增私人購物項目
         with st.container(border=True):
             st.markdown("**➕ 新增想買的商品 / 親友代購**")
             with st.form("add_private_shop_form", clear_on_submit=True):
@@ -1561,7 +1684,6 @@ else:
                         st.success(f"✅ 已加入「{s_item.strip()}」！")
                         st.rerun()
 
-        # 互動式勾選編輯表格
         if my_shop.empty:
             st.info("你的私人購物清單目前是空的，快把想買的藥妝、伴手禮或代購記下來吧！")
         else:
@@ -1600,7 +1722,6 @@ else:
         df_pack_all = load_sheet_df(ws_pack, PACKING_COLS)
         my_pack = df_pack_all[df_pack_all["擁有者"].str.strip() == current_user].copy()
 
-        # 進度條與一鍵匯入範本
         if my_pack.empty:
             st.info("你的個人行李清單目前是空的！你可以一鍵匯入「日本自由行常用行李範本」，再依個人需求增減：")
             if st.button("✨ 一鍵匯入日本自由行常用行李範本（10 項必備品）", type="primary"):
@@ -1624,7 +1745,6 @@ else:
             pct = packed_items / total_items if total_items > 0 else 0
             st.progress(pct, text=f"🧳 行李打包進度：已完成 **{packed_items} / {total_items}** 項（{int(pct * 100)}%）")
 
-        # 新增單項行李
         with st.container(border=True):
             st.markdown("**➕ 新增個人行李物品**")
             with st.form("add_packing_form", clear_on_submit=True):
