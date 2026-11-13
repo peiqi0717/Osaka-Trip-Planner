@@ -99,7 +99,7 @@ def save_data(df):
     ws.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
 
 # ==========================================
-# 3. Google 官方三重引擎座標解析與全鐵道查詢
+# 3. Google 官方 Places API (New) 座標解析與全鐵道查詢
 # ==========================================
 def is_google_maps_url(url):
     return any(domain in url.lower() for domain in [
@@ -107,7 +107,6 @@ def is_google_maps_url(url):
     ])
 
 def is_valid_kansai_coords(lat, lon):
-    """確認座標位於關西圈合理範圍內，並排除大阪府廳預設中心點"""
     if not ((33.0 <= lat <= 36.2) and (134.0 <= lon <= 137.0)):
         return False
     if abs(lat - 34.6863) < 0.0012 and abs(lon - 135.5197) < 0.0012:
@@ -131,7 +130,6 @@ def extract_coords_from_text(text):
     return None, None
 
 def resolve_google_maps_url(url):
-    """嘗試從 Google 地圖連結解析店家名稱與經緯度"""
     title = ""
     lat, lon = None, None
     try:
@@ -214,14 +212,7 @@ def is_ambiguous_chain(name, region="", note=""):
         return False
     return any(chain.lower() in name.lower() for chain in COMMON_CHAINS)
 
-def query_google_official_apis(place_name, region="", note=""):
-    """
-    呼叫 Google 官方三重介面取得精準座標與官方店名：
-    1. Places API (New) Text Search
-    2. Legacy Places API Text Search
-    3. Geocoding API
-    回傳: (lat, lon, official_name, error_msg)
-    """
+def query_google_places_new(place_name, region="", note=""):
     api_key = st.secrets.get("google_maps_api_key", "").strip()
     if not api_key:
         return None, None, "", "未設定 google_maps_api_key"
@@ -229,18 +220,14 @@ def query_google_official_apis(place_name, region="", note=""):
     reg_first = region.split("/")[0] if (region and region != "其他/未指定") else ""
     area_prefix = reg_first if reg_first else "大阪"
 
-    # 組合精準搜尋字串（包含店名、商圈與備註建築線索）
     clean_note = ""
     if note and not any(k in note for k in ["很多分店", "多家分店", "燒肉店", "咖哩飯"]):
         clean_note = note.strip()[:25]
 
     text_query = f"{place_name} {area_prefix} {clean_note}".strip()
-    if not any(k in text_query for k in ["大阪", "京都", "神戶", "奈良", "Osaka", "Kyoto"]):
+    if not any(k in text_query for k in ["大阪", "京都", "神戶", "奈良", "Osaka", "Kyoto", "関西", "關西"]):
         text_query = f"大阪 {text_query}"
 
-    last_error = ""
-
-    # --- 通道 1：Places API (New) ---
     try:
         res = requests.post(
             "https://places.googleapis.com/v1/places:searchText",
@@ -258,8 +245,10 @@ def query_google_official_apis(place_name, region="", note=""):
         )
         data = res.json()
         if "error" in data:
-            last_error = f"Places(New): {data['error'].get('message', '')}"
-        elif data.get("places"):
+            err_msg = data["error"].get("message", "未知 API 錯誤")
+            return None, None, "", err_msg
+
+        if data.get("places"):
             for p in data["places"]:
                 loc = p.get("location", {})
                 lat = float(loc.get("latitude", 0))
@@ -267,87 +256,12 @@ def query_google_official_apis(place_name, region="", note=""):
                 if is_valid_kansai_coords(lat, lon):
                     disp_name = p.get("displayName", {}).get("text", "")
                     return lat, lon, disp_name, ""
+
+        return None, None, "", ""
     except Exception as e:
-        last_error = str(e)
-
-    # --- 通道 2：Legacy Places API Text Search ---
-    try:
-        res = requests.get(
-            "https://maps.googleapis.com/maps/api/place/textsearch/json",
-            params={
-                "query": text_query,
-                "language": "zh-TW",
-                "region": "jp",
-                "key": api_key
-            },
-            timeout=6
-        )
-        data = res.json()
-        status = data.get("status", "")
-        if status == "OK" and data.get("results"):
-            for item in data["results"]:
-                loc = item.get("geometry", {}).get("location", {})
-                lat = float(loc.get("lat", 0))
-                lon = float(loc.get("lng", 0))
-                if is_valid_kansai_coords(lat, lon):
-                    return lat, lon, item.get("name", ""), ""
-        elif status not in ["OK", "ZERO_RESULTS"]:
-            last_error = f"Places(Legacy): {status} - {data.get('error_message', '')}"
-    except Exception as e:
-        last_error = str(e)
-
-    # --- 通道 3：Google Geocoding API ---
-    try:
-        res = requests.get(
-            "https://maps.googleapis.com/maps/api/geocode/json",
-            params={
-                "address": text_query,
-                "language": "zh-TW",
-                "region": "jp",
-                "key": api_key
-            },
-            timeout=6
-        )
-        data = res.json()
-        if data.get("status") == "OK" and data.get("results"):
-            for item in data["results"]:
-                # 排除過於寬泛的整個城市行政中心
-                types = item.get("types", [])
-                if "locality" in types or "administrative_area_level_1" in types:
-                    continue
-                loc = item.get("geometry", {}).get("location", {})
-                lat = float(loc.get("lat", 0))
-                lon = float(loc.get("lng", 0))
-                if is_valid_kansai_coords(lat, lon):
-                    return lat, lon, "", ""
-    except Exception as e:
-        last_error = str(e)
-
-    return None, None, "", last_error
-
-def search_free_fallback_coords(place_name, region=""):
-    """當未設定 Google API 金鑰時的免費備援查詢"""
-    reg_first = region.split("/")[0] if (region and region != "其他/未指定") else ""
-    q = f"{place_name} {reg_first} 大阪".strip()
-    try:
-        res = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": q, "format": "json", "limit": 3, "countrycodes": "jp"},
-            headers={"User-Agent": "OsakaTripPlannerApp/6.0"},
-            timeout=4
-        )
-        for item in res.json():
-            if item.get("class") == "boundary" or item.get("type") in ["administrative", "city", "prefecture"]:
-                continue
-            lat, lon = float(item["lat"]), float(item["lon"])
-            if is_valid_kansai_coords(lat, lon):
-                return lat, lon
-    except Exception:
-        pass
-    return None, None
+        return None, None, "", str(e)
 
 def format_walking_time(dist_str):
-    """將車站直線距離換算為實際預估步行分鐘數（日本標準 80m/分 × 1.2 街區係數）"""
     try:
         num_match = re.search(r'(\d+(?:\.\d+)?)', str(dist_str))
         if not num_match:
@@ -369,8 +283,8 @@ def clean_line_name(raw_line):
         return "Osaka Metro " + line[2:]
     return line
 
-def query_nearest_stations_all(lat, lon):
-    """查詢距離最近的車站（包含 Osaka Metro 地鐵、JR、阪急、阪神、南海、近鐵、京阪全部電鐵）"""
+def get_station_details(lat, lon):
+    """回傳結構化車站資訊：(顯示字串, 最近站名, 鄰近路線清單)"""
     try:
         res = requests.get(
             "https://express.heartrails.com/api/json",
@@ -379,13 +293,14 @@ def query_nearest_stations_all(lat, lon):
         )
         stations = res.json().get("response", {}).get("station", [])
         if not stations:
-            return "查無鄰近車站"
+            return "查無鄰近車站", "", []
 
         nearest = stations[0]
         nearest_name = nearest.get("name", "")
         walk_text = format_walking_time(nearest.get("distance", ""))
 
-        nearby_lines = []
+        nearby_lines_display = []
+        raw_lines_set = []
         for s in stations:
             s_name = s.get("name", "")
             dist_str = str(s.get("distance", ""))
@@ -397,57 +312,76 @@ def query_nearest_stations_all(lat, lon):
 
             if s_name == nearest_name or meters <= 250:
                 line_label = clean_line_name(s.get("line", ""))
+                if line_label not in raw_lines_set:
+                    raw_lines_set.append(line_label)
                 entry = line_label if s_name == nearest_name else f"{s_name}站-{line_label}"
-                if entry not in nearby_lines:
-                    nearby_lines.append(entry)
+                if entry not in nearby_lines_display:
+                    nearby_lines_display.append(entry)
 
-        lines_str = " / ".join(nearby_lines[:4])
+        lines_str = " / ".join(nearby_lines_display[:4])
         icon = "🚇" if "Osaka Metro" in lines_str else "🚃"
-        return f"{icon} {nearest_name}站（{lines_str}，{walk_text}）"
+        disp = f"{icon} {nearest_name}站（{lines_str}，{walk_text}）"
+        return disp, f"{nearest_name}站", raw_lines_set
     except Exception:
-        return "車站查詢逾時（可稍後補抓）"
+        return "車站查詢逾時（可稍後補抓）", "", []
 
-def resolve_place_and_subway(url, custom_name="", region="", note=""):
+def query_nearest_stations_all(lat, lon):
+    disp, _, _ = get_station_details(lat, lon)
+    return disp
+
+def resolve_place_full(url="", custom_name="", region="", note=""):
+    """完整解析地點，回傳 (標題, 車站顯示字串, lat, lon, 最近站名, 路線清單)"""
     final_title = custom_name.strip()
     lat, lon = None, None
 
-    # 1. 嘗試解析網址本身是否自帶標題與座標
-    if is_google_maps_url(url):
-        gmap_title, g_lat, g_lon = resolve_google_maps_url(url)
-        if not final_title and gmap_title:
-            final_title = gmap_title
-        lat, lon = g_lat, g_lon
-    else:
-        web_title, w_lat, w_lon = scrape_webpage_title_and_coords(url)
-        if not final_title and web_title:
-            final_title = web_title
-        lat, lon = w_lat, w_lon
-
-    if not final_title:
-        final_title = "YouTube 推薦影片" if ('youtube.com' in url or 'youtu.be' in url) else "未知地點 (需手動確認)"
-
-    # 2. 若為未指定分店的多家分店連鎖店，直接略過
-    if lat is None and is_ambiguous_chain(final_title, region, note):
-        return final_title, "⏭️ 疑有多家分店（未指定分店或區域，不自動匹配車站）"
-
-    # 3. 即使網址是 Google 地圖短網址但被擋沒抓到座標，也直接交給 Google 官方 API 反查
-    api_err = ""
-    if (lat is None or lon is None) and final_title not in ["未知地點 (需手動確認)", "YouTube 推薦影片"]:
-        g_lat, g_lon, official_name, api_err = query_google_official_apis(final_title, region, note)
-        if g_lat is not None and g_lon is not None:
+    if url:
+        if is_google_maps_url(url):
+            gmap_title, g_lat, g_lon = resolve_google_maps_url(url)
+            if not final_title and gmap_title:
+                final_title = gmap_title
             lat, lon = g_lat, g_lon
         else:
-            lat, lon = search_free_fallback_coords(final_title, region)
+            web_title, w_lat, w_lon = scrape_webpage_title_and_coords(url)
+            if not final_title and web_title:
+                final_title = web_title
+            lat, lon = w_lat, w_lon
+
+    if not final_title:
+        final_title = "YouTube 推薦影片" if (url and ('youtube.com' in url or 'youtu.be' in url)) else "未知地點 (需手動確認)"
+
+    if lat is None and is_ambiguous_chain(final_title, region, note):
+        return final_title, "⏭️ 疑有多家分店（未指定分店或區域，不自動匹配車站）", None, None, "", []
+
+    api_err = ""
+    if (lat is None or lon is None) and final_title not in ["未知地點 (需手動確認)", "YouTube 推薦影片"]:
+        g_lat, g_lon, official_name, api_err = query_google_places_new(final_title, region, note)
+        if g_lat is not None and g_lon is not None:
+            lat, lon = g_lat, g_lon
+            if not custom_name.strip() and official_name and final_title == "未知地點 (需手動確認)":
+                final_title = official_name
 
     if lat is not None and lon is not None:
-        subway_info = query_nearest_stations_all(lat, lon)
+        subway_info, st_name, st_lines = get_station_details(lat, lon)
+        return final_title, subway_info, lat, lon, st_name, st_lines
     else:
         if api_err:
-            subway_info = f"⚠️ Google API 提示：{api_err[:60]}"
+            subway_info = f"⚠️ Google API 提示：{api_err}"
         else:
             subway_info = "⚠️ 查無此店座標（請確認店名或貼完整電腦版地圖網址）"
+        return final_title, subway_info, None, None, "", []
 
-    return final_title, subway_info
+def resolve_place_and_subway(url, custom_name="", region="", note=""):
+    title, subway_info, _, _, _, _ = resolve_place_full(url, custom_name, region, note)
+    return title, subway_info
+
+def calc_haversine_km(lat1, lon1, lat2, lon2):
+    """計算兩組經緯度之間的直線公里數"""
+    R = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 # ==========================================
 # 4. 產生美化 Excel 報表 (記憶體串流版)
@@ -658,8 +592,9 @@ has_gmap_key = bool(st.secrets.get("google_maps_api_key", "").strip())
 key_badge = "✅ Google 地圖 API 已連線" if has_gmap_key else "⚠️ 尚未偵測到 Google 地圖 API 金鑰"
 st.caption(f"📊 目前共收錄 **{len(df_links)}** 筆景點與美食 ｜ {key_badge} ｜ [📄 直接開啟 Google 雲端試算表]({st.secrets['sheet_url']})")
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📋 瀏覽共用清單",
+    "🧭 路線與距離試算",
     "➕ 新增連結",
     "✏️ 修改 / 刪除",
     "📊 匯出精美 Excel"
@@ -749,8 +684,183 @@ with tab1:
             }
         )
 
-# --- 分頁 2：新增連結 ---
+# --- 分頁 2：路線與距離試算 (雙向比對) ---
 with tab2:
+    st.subheader("🧭 基準定點（飯店 / 機場）↔ 景點雙向距離與轉乘試算")
+    st.caption("設定你們的飯店或機場作為基準定點，選擇行進方向與想去的景點，系統會自動計算距離、步行時間、電車轉乘線索與 Google Maps 導航。")
+
+    # 步驟 1：設定基準定點
+    with st.container(border=True):
+        st.markdown("**步驟 1️⃣：設定基準定點（例如：飯店、關西機場、難波車站）**")
+        base_col1, base_col2 = st.columns([3, 1])
+        with base_col1:
+            base_input = st.text_input(
+                "貼上 Google Maps 網址，或直接輸入飯店 / 機場名稱",
+                value=st.session_state.get("base_raw_input", ""),
+                placeholder="例如：https://maps.app.goo.gl/... 或 難波東方酒店 / 關西國際機場"
+            )
+        with base_col2:
+            st.write("")
+            st.write("")
+            lock_base_btn = st.button("📍 確認設定定點", type="primary", use_container_width=True)
+
+        if lock_base_btn and base_input.strip():
+            with st.spinner("🔍 正在解析基準定點座標與最近車站..."):
+                raw_b = base_input.strip()
+                url_m = re.search(r'https?://[^\s]+', raw_b)
+                if url_m:
+                    b_url = url_m.group(0)
+                    b_custom = raw_b.replace(b_url, "").strip()
+                else:
+                    b_url = ""
+                    b_custom = raw_b
+
+                b_title, b_sub, b_lat, b_lon, b_st_name, b_st_lines = resolve_place_full(
+                    url=b_url, custom_name=b_custom
+                )
+                if b_lat is not None and b_lon is not None:
+                    st.session_state["base_raw_input"] = raw_b
+                    st.session_state["base_info"] = {
+                        "title": b_title if b_title != "未知地點 (需手動確認)" else (b_custom or "已設定基準點"),
+                        "subway": b_sub,
+                        "lat": b_lat,
+                        "lon": b_lon,
+                        "st_name": b_st_name,
+                        "st_lines": b_st_lines
+                    }
+                else:
+                    st.error(f"❌ 無法解析基準定點位置：{b_sub}")
+
+        if "base_info" in st.session_state:
+            bi = st.session_state["base_info"]
+            st.success(f"🏨 目前基準定點：**{bi['title']}** ｜ 最近車站：{bi['subway']}")
+
+    # 步驟 2：選擇方向與目標景點
+    if df_links.empty:
+        st.info("目前清單尚無景點，請先到「➕ 新增連結」加入資料後即可進行路線比對！")
+    else:
+        with st.container(border=True):
+            st.markdown("**步驟 2️⃣：選擇路線方向與要比對的景點**")
+            dir_mode = st.radio(
+                "行進方向：",
+                [
+                    "🏨 從【基準定點】出發 ➔ 前往【所選景點】",
+                    "🎯 從【所選景點】出發 ➔ 返回【基準定點】"
+                ],
+                horizontal=True
+            )
+
+            spot_options_map = {}
+            for idx, r in df_links.iterrows():
+                s_name = r["自訂名稱"] if str(r["自訂名稱"]).strip() else (r["自動抓取標題"] if str(r["自動抓取標題"]).strip() else r["網址"][:30])
+                label = f"[{idx}] {s_name}（{r['區域']}｜{r['分類']}）"
+                spot_options_map[label] = idx
+
+            selected_spot_labels = st.multiselect(
+                "選擇要比對的景點（可單選，也可多選一次比較多個景點距離）：",
+                options=list(spot_options_map.keys()),
+                default=list(spot_options_map.keys())[:1] if spot_options_map else []
+            )
+
+            calc_route_btn = st.button("🚀 開始試算距離與轉乘路線", type="primary")
+
+        if calc_route_btn:
+            if "base_info" not in st.session_state:
+                st.warning("⚠️ 請先在上方「步驟 1」輸入並確認基準定點（飯店或機場）喔！")
+            elif not selected_spot_labels:
+                st.warning("⚠️ 請至少選擇一個要比對的景點！")
+            else:
+                bi = st.session_state["base_info"]
+                is_from_base = dir_mode.startswith("🏨")
+                results_rows = []
+
+                prog_r = st.progress(0, text="🧭 正在計算距離、步行時間與電車轉乘線索...")
+                for i, lbl in enumerate(selected_spot_labels):
+                    idx = spot_options_map[lbl]
+                    row = df_links.loc[idx]
+                    s_name = str(row["自訂名稱"]).strip() or str(row["自動抓取標題"]).strip()
+                    s_url = str(row["網址"]).strip()
+                    s_reg = str(row["區域"]).strip()
+                    s_note = str(row["備註"]).strip()
+
+                    _, s_sub, s_lat, s_lon, s_st_name, s_st_lines = resolve_place_full(
+                        url=s_url, custom_name=s_name, region=s_reg, note=s_note
+                    )
+
+                    if s_lat is not None and s_lon is not None:
+                        dist_km = calc_haversine_km(bi["lat"], bi["lon"], s_lat, s_lon)
+                        est_walk_mins = max(1, round((dist_km * 1000 * 1.25) / 80))
+
+                        # 判斷起終點順序
+                        if is_from_base:
+                            orig_title, dest_title = bi["title"], s_name
+                            orig_lat, orig_lon = bi["lat"], bi["lon"]
+                            dest_lat, dest_lon = s_lat, s_lon
+                            orig_st, dest_st = bi["st_name"], s_st_name
+                        else:
+                            orig_title, dest_title = s_name, bi["title"]
+                            orig_lat, orig_lon = s_lat, s_lon
+                            dest_lat, dest_lon = bi["lat"], bi["lon"]
+                            orig_st, dest_st = s_st_name, bi["st_name"]
+
+                        # 比對是否有共線可一線直達
+                        common_lines = list(set(bi["st_lines"]) & set(s_st_lines))
+                        if dist_km <= 1.2:
+                            transit_hint = f"🚶 距離僅 {dist_km:.2f} km，散步約 {est_walk_mins} 分鐘可達（免搭車）"
+                        elif orig_st and dest_st and orig_st == dest_st:
+                            transit_hint = f"🚶 兩地皆在【{orig_st}】生活圈（直線 {dist_km:.2f} km，步行約 {est_walk_mins} 分鐘）"
+                        elif common_lines:
+                            transit_hint = f"✨ 可搭【{common_lines[0]}】一線直達免轉乘（{orig_st} ➔ {dest_st}）"
+                        elif orig_st and dest_st:
+                            transit_hint = f"🔄 需轉乘：{orig_st} ➔ {dest_st}（直線 {dist_km:.1f} km）"
+                        else:
+                            transit_hint = f"📍 直線距離 {dist_km:.1f} km"
+
+                        # Google Maps 實際大眾運輸導航連結
+                        gmap_dir_url = (
+                            f"https://www.google.com/maps/dir/?api=1"
+                            f"&origin={orig_lat},{orig_lon}"
+                            f"&destination={dest_lat},{dest_lon}"
+                            f"&travelmode=transit"
+                        )
+
+                        results_rows.append({
+                            "起點 ➔ 終點": f"{orig_title} ➔ {dest_title}",
+                            "直線距離": f"{dist_km:.2f} km",
+                            "純步行預估": f"約 {est_walk_mins} 分鐘",
+                            "電車轉乘建議": transit_hint,
+                            "景點最近車站": s_sub,
+                            "實際路線導航": gmap_dir_url
+                        })
+                    else:
+                        results_rows.append({
+                            "起點 ➔ 終點": f"{bi['title']} ↔ {s_name}",
+                            "直線距離": "無法計算",
+                            "純步行預估": "-",
+                            "電車轉乘建議": f"⚠️ 該景點尚未取得座標（{s_sub}）",
+                            "景點最近車站": s_sub,
+                            "實際路線導航": ""
+                        })
+
+                    prog_r.progress((i + 1) / len(selected_spot_labels))
+                prog_r.empty()
+
+                if results_rows:
+                    res_df = pd.DataFrame(results_rows)
+                    st.dataframe(
+                        res_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "實際路線導航": st.column_config.LinkColumn(
+                                "Google Maps 轉乘導航",
+                                display_text="🗺️ 查看時刻與轉乘"
+                            )
+                        }
+                    )
+
+# --- 分頁 3：新增連結 ---
+with tab3:
     with st.form("add_link_form", clear_on_submit=True):
         st.subheader("新增景點 / 餐廳 / 購物連結")
         raw_input = st.text_input("🔗 貼上網址（支援 Google Maps、IG、食記或一般網頁）*", placeholder="https://...")
@@ -817,8 +927,8 @@ with tab2:
                         st.success(f"✅ 新增成功！「{fetched_title}」｜{subway_result}")
                         st.rerun()
 
-# --- 分頁 3：修改 / 刪除 ---
-with tab3:
+# --- 分頁 4：修改 / 刪除 ---
+with tab4:
     if df_links.empty:
         st.info("目前清單沒有任何資料可以修改或刪除。")
     else:
@@ -883,8 +993,8 @@ with tab3:
             st.success("✅ 已成功刪除該筆連結！")
             st.rerun()
 
-# --- 分頁 4：匯出精美 Excel ---
-with tab4:
+# --- 分頁 5：匯出精美 Excel ---
+with tab5:
     st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、依區域上色分類，並產生包含「總表」與各分類分頁的 Excel 檔案。")
     if df_links.empty:
         st.info("目前沒有資料可以匯出喔！")
