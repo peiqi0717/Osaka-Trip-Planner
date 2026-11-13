@@ -330,6 +330,7 @@ def query_nearest_stations_all(lat, lon):
     return disp
 
 def resolve_place_full(url="", custom_name="", region="", note=""):
+    """完整解析地點，回傳 (標題, 車站顯示字串, lat, lon, 最近站名, 路線清單)"""
     final_title = custom_name.strip()
     lat, lon = None, None
 
@@ -374,36 +375,13 @@ def resolve_place_and_subway(url, custom_name="", region="", note=""):
     return title, subway_info
 
 def calc_haversine_km(lat1, lon1, lat2, lon2):
+    """計算兩組經緯度之間的直線公里數"""
     R = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dp = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-def estimate_travel_duration(dist_km, is_direct_line=False):
-    """
-    依距離與是否直達估算實際所需移動時間（含步行進出站與候車轉乘時間）：
-    - <= 1.2 km：建議直接步行
-    - 1.2 ~ 15 km：大阪市區地鐵/電鐵移動（含進出站約 8~12 分鐘）
-    - > 15 km：中長距離/機場特急移動（如關西機場至市區、大阪至京都神戶）
-    """
-    if dist_km <= 1.2:
-        walk_mins = max(1, round((dist_km * 1000 * 1.25) / 80))
-        return f"🚶 步行約 {walk_mins} 分鐘"
-
-    buffer_mins = 8 if is_direct_line else 14
-    if dist_km <= 15.0:
-        # 市區軌道實際軌距約為直線 1.25 倍，均速約 30 km/h
-        ride_mins = round((dist_km * 1.25 / 30.0) * 60)
-    else:
-        # 長距離快車/特急均速約 55 km/h
-        ride_mins = round((dist_km * 1.2 / 55.0) * 60)
-
-    total_mins = max(10, ride_mins + buffer_mins)
-    low = max(8, round(total_mins / 5) * 5 - 3)
-    high = low + 8
-    return f"🚃 搭車約 {low}～{high} 分鐘"
 
 # ==========================================
 # 4. 產生美化 Excel 報表 (記憶體串流版)
@@ -709,8 +687,9 @@ with tab1:
 # --- 分頁 2：路線與距離試算 (雙向比對) ---
 with tab2:
     st.subheader("🧭 基準定點（飯店 / 機場）↔ 景點雙向距離與轉乘試算")
-    st.caption("設定你們的飯店或機場作為基準定點，選擇行進方向與想去的景點，系統會自動計算直線距離、預估乘車時間、電車轉乘線索與 Google Maps 導航。")
+    st.caption("設定你們的飯店或機場作為基準定點，選擇行進方向與想去的景點，系統會自動計算距離、步行時間、電車轉乘線索與 Google Maps 導航。")
 
+    # 步驟 1：設定基準定點
     with st.container(border=True):
         st.markdown("**步驟 1️⃣：設定基準定點（例如：飯店、關西機場、難波車站）**")
         base_col1, base_col2 = st.columns([3, 1])
@@ -756,6 +735,7 @@ with tab2:
             bi = st.session_state["base_info"]
             st.success(f"🏨 目前基準定點：**{bi['title']}** ｜ 最近車站：{bi['subway']}")
 
+    # 步驟 2：選擇方向與目標景點
     if df_links.empty:
         st.info("目前清單尚無景點，請先到「➕ 新增連結」加入資料後即可進行路線比對！")
     else:
@@ -794,7 +774,7 @@ with tab2:
                 is_from_base = dir_mode.startswith("🏨")
                 results_rows = []
 
-                prog_r = st.progress(0, text="🧭 正在計算直線距離、預估乘車時間與轉乘線索...")
+                prog_r = st.progress(0, text="🧭 正在計算距離、步行時間與電車轉乘線索...")
                 for i, lbl in enumerate(selected_spot_labels):
                     idx = spot_options_map[lbl]
                     row = df_links.loc[idx]
@@ -809,7 +789,9 @@ with tab2:
 
                     if s_lat is not None and s_lon is not None:
                         dist_km = calc_haversine_km(bi["lat"], bi["lon"], s_lat, s_lon)
+                        est_walk_mins = max(1, round((dist_km * 1000 * 1.25) / 80))
 
+                        # 判斷起終點順序
                         if is_from_base:
                             orig_title, dest_title = bi["title"], s_name
                             orig_lat, orig_lon = bi["lat"], bi["lon"]
@@ -821,21 +803,20 @@ with tab2:
                             dest_lat, dest_lon = bi["lat"], bi["lon"]
                             orig_st, dest_st = s_st_name, bi["st_name"]
 
+                        # 比對是否有共線可一線直達
                         common_lines = list(set(bi["st_lines"]) & set(s_st_lines))
-                        is_direct = bool(common_lines)
-                        est_time_str = estimate_travel_duration(dist_km, is_direct_line=is_direct)
-
                         if dist_km <= 1.2:
-                            transit_hint = "🚶 距離很近，散步即可抵達（免搭電車）"
+                            transit_hint = f"🚶 距離僅 {dist_km:.2f} km，散步約 {est_walk_mins} 分鐘可達（免搭車）"
                         elif orig_st and dest_st and orig_st == dest_st:
-                            transit_hint = f"🚶 兩地皆在【{orig_st}】生活圈"
+                            transit_hint = f"🚶 兩地皆在【{orig_st}】生活圈（直線 {dist_km:.2f} km，步行約 {est_walk_mins} 分鐘）"
                         elif common_lines:
                             transit_hint = f"✨ 可搭【{common_lines[0]}】一線直達免轉乘（{orig_st} ➔ {dest_st}）"
                         elif orig_st and dest_st:
-                            transit_hint = f"🔄 需轉乘：{orig_st} ➔ {dest_st}"
+                            transit_hint = f"🔄 需轉乘：{orig_st} ➔ {dest_st}（直線 {dist_km:.1f} km）"
                         else:
-                            transit_hint = "📍 建議點擊右側查看 Google Maps 詳細轉乘"
+                            transit_hint = f"📍 直線距離 {dist_km:.1f} km"
 
+                        # Google Maps 實際大眾運輸導航連結
                         gmap_dir_url = (
                             f"https://www.google.com/maps/dir/?api=1"
                             f"&origin={orig_lat},{orig_lon}"
@@ -846,7 +827,7 @@ with tab2:
                         results_rows.append({
                             "起點 ➔ 終點": f"{orig_title} ➔ {dest_title}",
                             "直線距離": f"{dist_km:.2f} km",
-                            "預估移動時間": est_time_str,
+                            "純步行預估": f"約 {est_walk_mins} 分鐘",
                             "電車轉乘建議": transit_hint,
                             "景點最近車站": s_sub,
                             "實際路線導航": gmap_dir_url
@@ -855,7 +836,7 @@ with tab2:
                         results_rows.append({
                             "起點 ➔ 終點": f"{bi['title']} ↔ {s_name}",
                             "直線距離": "無法計算",
-                            "預估移動時間": "-",
+                            "純步行預估": "-",
                             "電車轉乘建議": f"⚠️ 該景點尚未取得座標（{s_sub}）",
                             "景點最近車站": s_sub,
                             "實際路線導航": ""
