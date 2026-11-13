@@ -8,6 +8,7 @@ import datetime
 from datetime import timezone, timedelta
 
 import pandas as pd
+import pydeck as pdk
 import requests
 from bs4 import BeautifulSoup
 import openpyxl
@@ -38,6 +39,14 @@ REGION_OPTIONS = ["難波/心齋橋", "梅田", "天王寺/阿倍野", "環球�
 SHOP_CAT_OPTIONS = ["藥妝美妝", "伴手禮/零食", "服飾/精品", "動漫/雜貨", "親友代購", "其他"]
 PACK_CAT_OPTIONS = ["重要證件/錢包", "3C電子/網路", "衣物穿搭", "盥洗/常備藥品", "隨身小物", "其他"]
 WEEKDAY_ZH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+
+CAT_COLOR_RGBA = {
+    "美食": [255, 87, 51, 220],         # 橘紅色
+    "購物": [155, 89, 182, 220],        # 亮紫色
+    "景點與地標": [39, 174, 96, 220],   # 翠綠色
+    "交通/住宿": [41, 128, 185, 220],   # 寶藍色
+    "未分類": [127, 140, 141, 220]      # 鐵灰色
+}
 
 DEFAULT_PACKING_TEMPLATE = [
     ("重要證件/錢包", "護照（確認效期 6 個月以上）", "1"),
@@ -165,7 +174,6 @@ def save_data(df):
     save_sheet_df(ws, df, DEFAULT_COLS)
 
 def load_trip_dates():
-    """從試算表『旅遊設定』工作表讀取全團共用的出發與回程日期"""
     ws_meta = get_or_create_ws("旅遊設定", META_COLS)
     df_meta = load_sheet_df(ws_meta, META_COLS)
     meta_dict = dict(zip(df_meta["設定鍵"], df_meta["設定值"]))
@@ -300,7 +308,6 @@ def calculate_combined_twd_settlements(df_exp, jpy_to_twd_rate):
     return _solve_debt_graph(paid_map, owed_map)
 
 def ask_travel_ai_assistant(user_prompt, df_itin, df_links, trip_days_info):
-    """呼叫 Gemini API 進行大阪行程合理性、交通順暢度與推薦分析"""
     gemini_key = st.secrets.get("gemini_api_key", "").strip()
     if not gemini_key:
         return "⚠️ 尚未設定 `gemini_api_key`！請在 Streamlit Secrets 貼上免費的 Google AI Studio API Key 即可啟用 AI 旅遊小助手。"
@@ -353,7 +360,7 @@ def ask_travel_ai_assistant(user_prompt, df_itin, df_links, trip_days_info):
         return f"⚠️ AI 小助手連線發生錯誤：{e}"
 
 # ==========================================
-# 5. Google Places API (New) 座標與全鐵道解析
+# 5. Google Places API (New) 座標與全鐵道解析（含快取）
 # ==========================================
 def is_google_maps_url(url):
     return any(domain in url.lower() for domain in [
@@ -578,7 +585,8 @@ def get_station_details(lat, lon):
     except Exception:
         return "車站查詢逾時（可稍後補抓）", "", []
 
-def resolve_place_full(url="", custom_name="", region="", note=""):
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_resolve_place_full(url="", custom_name="", region="", note=""):
     final_title = custom_name.strip()
     lat, lon = None, None
 
@@ -617,6 +625,9 @@ def resolve_place_full(url="", custom_name="", region="", note=""):
         else:
             subway_info = "⚠️ 查無此店座標（請確認店名或貼完整電腦版地圖網址）"
         return final_title, subway_info, None, None, "", []
+
+def resolve_place_full(url="", custom_name="", region="", note=""):
+    return cached_resolve_place_full(url.strip(), custom_name.strip(), region.strip(), note.strip())
 
 def resolve_free_text_or_url(raw_text):
     raw_b = raw_text.strip()
@@ -981,10 +992,10 @@ if st.session_state["workspace_area"] is None:
             st.subheader("🌍 大家共用區（團隊協作）")
             st.write("所有同行夥伴共同編輯與查詢的旅遊大本營：")
             st.markdown("""
-            * 📅 **每日行程排程器 ＆ AI 顧問**：日曆排程、時間軸/表格雙視角、AI 健檢路線
+            * 📅 **每日行程排程器 ＆ AI 顧問**：日曆排程、相鄰景點距離自動提示、AI 路線健檢
+            * 🗺️ **全景點互動地圖總覽**：可縮放地圖檢視所有美食/景點分佈與單日動線連線
             * 📋 **共用旅遊清單**：瀏覽所有美食、購物、景點與最近車站
             * 🧭 **路線與距離試算**：飯店/機場雙向路線、任意兩定點對比
-            * ➕ **新增 / ✏️ 修改景點**：自動解析 Google 地圖與鐵道轉乘
             * 💰 **共同支出＆分帳計算機**：記錄代墊款項，即時匯率合併結算誰給誰錢
             * 📊 **匯出精美 Excel**：含每日行程表與各分類上色分頁
             """)
@@ -1049,8 +1060,9 @@ if st.session_state["workspace_area"] == "shared":
     key_badge = "✅ Google 地圖 API 已連線" if has_gmap_key else "⚠️ 尚未偵測到 Google 地圖 API 金鑰"
     st.caption(f"📊 目前共收錄 **{len(df_links)}** 筆景點與美食 ｜ {key_badge} ｜ [📄 開啟 Google 雲端試算表]({st.secrets['sheet_url']})")
 
-    tab_itin, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab_itin, tab_map, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📅 每日行程排程 ＆ AI 顧問",
+        "🗺️ 互動地圖總覽",
         "📋 共用旅遊清單",
         "🧭 路線與距離試算",
         "➕ 新增連結",
@@ -1059,12 +1071,15 @@ if st.session_state["workspace_area"] == "shared":
         "📊 匯出精美 Excel"
     ])
 
+    # 共用讀取每日行程與日期設定（供排程分頁、地圖分頁與 Excel 匯出使用）
+    saved_start, saved_end = load_trip_dates()
+    ws_itin = get_or_create_ws("每日行程", ITINERARY_COLS)
+    df_itin = load_sheet_df(ws_itin, ITINERARY_COLS)
+
     # --- 共用分頁 0：📅 每日行程排程器 ＆ AI 旅遊顧問 ---
     with tab_itin:
         st.subheader("📅 直覺式每日行程排程器 ＆ 🤖 AI 路線顧問")
 
-        # 步驟 1：日曆設定旅程日期
-        saved_start, saved_end = load_trip_dates()
         with st.container(border=True):
             st.markdown("**步驟 1️⃣：在日曆選擇旅程的「出發日」與「回程日」**")
             d_col1, d_col2, d_col3 = st.columns([2, 2, 1])
@@ -1091,7 +1106,6 @@ if st.session_state["workspace_area"] == "shared":
             total_days = (active_end - active_start).days + 1
             st.caption(f"🗓️ 目前設定：**{active_start.strftime('%Y/%m/%d')} ({WEEKDAY_ZH[active_start.weekday()]})** ～ **{active_end.strftime('%Y/%m/%d')} ({WEEKDAY_ZH[active_end.weekday()]})**，共 **{total_days} 天 {max(0, total_days - 1)} 夜**")
 
-        # 建立 Day 1 ~ Day N 選單標籤
         day_options = []
         day_date_map = {}
         for d_idx in range(total_days):
@@ -1102,17 +1116,20 @@ if st.session_state["workspace_area"] == "shared":
             day_options.append(full_label)
             day_date_map[full_label] = (day_tag, f"{cur_d.strftime('%Y-%m-%d')} ({w_str})")
 
-        ws_itin = get_or_create_ws("每日行程", ITINERARY_COLS)
-        df_itin = load_sheet_df(ws_itin, ITINERARY_COLS)
-
-        # 步驟 2：快速加入行程項目
+        # 步驟 2：快速加入行程項目（含未排入篩選）
         with st.container(border=True):
             st.markdown("**步驟 2️⃣：將景點或活動排入行程**")
-            add_source = st.radio(
-                "選擇加入方式：",
-                ["📋 從「共用旅遊清單」挑選景點", "✏️ 手動輸入自訂行程（如：搭飛機、飯店 Check-in、自由逛街）"],
-                horizontal=True
-            )
+            opt_c1, opt_c2 = st.columns([3, 2])
+            with opt_c1:
+                add_source = st.radio(
+                    "選擇加入方式：",
+                    ["📋 從「共用旅遊清單」挑選景點", "✏️ 手動輸入自訂行程（如：搭飛機、飯店 Check-in）"],
+                    horizontal=True
+                )
+            with opt_c2:
+                only_unscheduled = st.checkbox("✨ 只顯示「尚未排進任何一天」的景點", value=True)
+
+            scheduled_names_set = set(df_itin["行程名稱"].str.strip().tolist()) if not df_itin.empty else set()
 
             with st.form("add_itinerary_form", clear_on_submit=True):
                 ic1, ic2, ic3 = st.columns([2, 1.2, 3.8])
@@ -1130,10 +1147,19 @@ if st.session_state["workspace_area"] == "shared":
                             spot_choices = {}
                             for idx, r in df_links.iterrows():
                                 s_title = str(r["自訂名稱"]).strip() or str(r["自動抓取標題"]).strip() or str(r["網址"])[:30]
-                                s_lbl = f"[{idx}] {s_title}（{r['區域']}｜{r['分類']}）"
+                                is_used = s_title in scheduled_names_set
+                                if only_unscheduled and is_used:
+                                    continue
+                                tag_used = " ✅[已排]" if is_used else ""
+                                s_lbl = f"[{idx}] {s_title}（{r['區域']}｜{r['分類']}）{tag_used}"
                                 spot_choices[s_lbl] = idx
-                            chosen_spot_lbl = st.selectbox("選擇要排入的景點 *", list(spot_choices.keys()))
-                            sel_spot_idx = spot_choices[chosen_spot_lbl]
+
+                            if not spot_choices:
+                                st.success("🎉 共用清單裡的景點已經全部排進行程表囉！（取消勾選右上角篩選即可重複排入）")
+                                sel_spot_idx = None
+                            else:
+                                chosen_spot_lbl = st.selectbox("選擇要排入的景點 *", list(spot_choices.keys()))
+                                sel_spot_idx = spot_choices[chosen_spot_lbl]
                     in_note = st.text_input("行程備註（選填）", placeholder="例如：已訂位 18:30、記得先抽整理券")
                 else:
                     with ic3:
@@ -1150,7 +1176,7 @@ if st.session_state["workspace_area"] == "shared":
 
                     if add_source.startswith("📋"):
                         if df_links.empty or sel_spot_idx is None:
-                            st.warning("⚠️ 請先在共用清單新增景點，或改用手動輸入！")
+                            st.warning("⚠️ 請先選擇有效的景點，或改用手動輸入！")
                         else:
                             r = df_links.loc[sel_spot_idx]
                             s_title = str(r["自訂名稱"]).strip() or str(r["自動抓取標題"]).strip()
@@ -1195,11 +1221,11 @@ if st.session_state["workspace_area"] == "shared":
         st.divider()
 
         # 步驟 3：行程呈現（時間軸模式 vs 表格模式自由切換）
-        view_c1, view_c2 = st.columns([2, 2])
+        view_c1, view_c2 = st.columns([2.2, 1.8])
         with view_c1:
             view_mode = st.radio(
                 "👀 選擇行程呈現模式：",
-                ["⏳ 時間軸卡片模式（按天切換，適合手機看動線）", "📊 總覽表格模式（一眼看全趟行程表）"],
+                ["⏳ 時間軸卡片模式（含相鄰景點距離自動計算）", "📊 總覽表格模式（一眼看全趟行程表）"],
                 horizontal=True
             )
         with view_c2:
@@ -1208,7 +1234,6 @@ if st.session_state["workspace_area"] == "shared":
         if df_itin.empty:
             st.info("目前行程表還是空的，快從上方步驟 2 開始把景點排進每一天吧！")
         else:
-            # 依天數編號與時間排序
             df_itin["_day_num"] = df_itin["天數"].apply(
                 lambda x: int(re.search(r'\d+', str(x)).group(0)) if re.search(r'\d+', str(x)) else 999
             )
@@ -1220,16 +1245,22 @@ if st.session_state["workspace_area"] == "shared":
             else:
                 df_show_itin = df_itin_sorted.copy()
 
-            # 模式 1：⏳ 時間軸卡片模式
+            # 模式 1：⏳ 時間軸卡片模式（自動計算每一站到下一站的距離與步行/搭車時間）
             if view_mode.startswith("⏳"):
                 if df_show_itin.empty:
                     st.info(f"「{filter_day_choice}」目前還沒有安排任何行程喔！")
                 else:
+                    # 建立共用清單名稱與區域/備註對照表，加快座標解析
+                    link_meta_map = {}
+                    for _, lr in df_links.iterrows():
+                        l_name = str(lr["自訂名稱"]).strip() or str(lr["自動抓取標題"]).strip()
+                        if l_name:
+                            link_meta_map[l_name] = (str(lr["網址"]).strip(), str(lr["區域"]).strip(), str(lr["備註"]).strip())
+
                     for day_tag, group in df_show_itin.groupby("天數", sort=False):
                         date_label = group.iloc[0]["日期"]
                         st.markdown(f"### 🗓️ {day_tag} ｜ {date_label}")
 
-                        # 產生當日 Google Maps 多點串連路線按鈕
                         places_for_route = [
                             urllib.parse.quote(f"大阪 {str(row['行程名稱']).strip()}")
                             for _, row in group.iterrows()
@@ -1247,18 +1278,46 @@ if st.session_state["workspace_area"] == "shared":
                             )
                             st.markdown(f"👉 **[🗺️ 一鍵開啟 {day_tag} 完整順路多點導航（共 {len(places_for_route)} 站）]({multi_route_url})**")
 
-                        for orig_idx, row in group.iterrows():
+                        group_items = list(group.iterrows())
+                        resolved_coords_list = []
+                        for _, r_item in group_items:
+                            s_n = str(r_item["行程名稱"]).strip()
+                            u_str, reg_str, note_str = link_meta_map.get(s_n, (str(r_item["網址"]).strip(), "", ""))
+                            _, _, lat_v, lon_v, _, st_lines_v = resolve_place_full(url=u_str, custom_name=s_n, region=reg_str, note=note_str)
+                            resolved_coords_list.append((lat_v, lon_v, st_lines_v))
+
+                        for pos_i, (orig_idx, row) in enumerate(group_items):
                             with st.container(border=True):
-                                t_c1, t_c2, t_c3 = st.columns([1.2, 5.8, 1.5])
+                                t_c1, t_c2, t_c3 = st.columns([1.5, 5.2, 1.8])
                                 with t_c1:
-                                    st.markdown(f"#### ⏰ {row['時間']}")
+                                    try:
+                                        h_val, m_val = map(int, str(row["時間"]).split(":")[:2])
+                                        cur_t_obj = datetime.time(h_val, m_val)
+                                    except Exception:
+                                        cur_t_obj = datetime.time(10, 0)
+
+                                    new_t_obj = st.time_input(
+                                        "⏰ 時間",
+                                        value=cur_t_obj,
+                                        step=900,
+                                        key=f"edit_time_{orig_idx}",
+                                        label_visibility="collapsed"
+                                    )
+                                    if new_t_obj.strftime("%H:%M") != str(row["時間"]).strip():
+                                        if st.button("💾 更新時間", key=f"save_time_{orig_idx}", type="primary", use_container_width=True):
+                                            df_itin.at[orig_idx, "時間"] = new_t_obj.strftime("%H:%M")
+                                            df_itin_clean = df_itin.drop(columns=["_day_num"], errors="ignore")
+                                            save_sheet_df(ws_itin, df_itin_clean, ITINERARY_COLS)
+                                            st.rerun()
                                     st.caption(f"🏷️ {row['分類']}")
+
                                 with t_c2:
                                     st.markdown(f"**{row['行程名稱']}**")
                                     if str(row["最近車站"]).strip() and str(row["最近車站"]).strip() != "-":
                                         st.caption(f"🚉 {row['最近車站']}")
                                     if str(row["備註"]).strip():
                                         st.write(f"📝 {row['備註']}")
+
                                 with t_c3:
                                     if str(row["網址"]).strip().startswith("http"):
                                         st.link_button("🔗 連結", str(row["網址"]).strip(), use_container_width=True)
@@ -1266,6 +1325,30 @@ if st.session_state["workspace_area"] == "shared":
                                         df_itin = df_itin.drop(orig_idx).drop(columns=["_day_num"], errors="ignore").reset_index(drop=True)
                                         save_sheet_df(ws_itin, df_itin, ITINERARY_COLS)
                                         st.rerun()
+
+                            # 自動在兩站之間顯示距離與預估移動時間提示條
+                            if pos_i < len(group_items) - 1:
+                                lat1, lon1, lines1 = resolved_coords_list[pos_i]
+                                lat2, lon2, lines2 = resolved_coords_list[pos_i + 1]
+                                next_name = group_items[pos_i + 1][1]["行程名稱"]
+                                if lat1 is not None and lat2 is not None:
+                                    dkm = calc_haversine_km(lat1, lon1, lat2, lon2)
+                                    is_dir = bool(set(lines1) & set(lines2))
+                                    dur_txt = estimate_travel_duration(dkm, is_direct_line=is_dir)
+                                    direct_badge = " ｜ ✨ 同一條鐵道線直達" if (is_dir and dkm > 1.2) else ""
+                                    st.markdown(
+                                        f"<div style='margin:-6px 0 8px 24px; padding:6px 14px; border-left:3px solid #2ecc71; background-color:rgba(46, 204, 113, 0.08); border-radius:4px; font-size:0.9rem;'>"
+                                        f"⬇️ 前往下一站【<b>{next_name}</b>】：直線距離約 <b>{dkm:.2f} km</b> ｜ <b>{dur_txt}</b>{direct_badge}"
+                                        f"</div>",
+                                        unsafe_allow_html=True
+                                    )
+                                else:
+                                    st.markdown(
+                                        f"<div style='margin:-6px 0 8px 24px; padding:4px 14px; border-left:3px solid #bdc3c7; color:#7f8c8d; font-size:0.85rem;'>"
+                                        f"⬇️ 前往下一站【{next_name}】"
+                                        f"</div>",
+                                        unsafe_allow_html=True
+                                    )
 
             # 模式 2：📊 總覽表格模式
             else:
@@ -1301,9 +1384,9 @@ if st.session_state["workspace_area"] == "shared":
             if not has_gemini:
                 st.info("""
                 💡 **尚未啟用 AI 小助手（設定只需 30 秒且完全免費）**：
-                1. 前往 Google 官方的 **[Google AI Studio](https://aistudio.google.com/apikey)**，登入 Google 帳號並點 **「Create API key」** 複製金鑰。
+                1. 前往 Google 官方的 **[Google AI Studio](https://aistudio.google.com/apikey)**，登入私人 Google 帳號並點 **「Create API key」** 複製金鑰。
                 2. 打開 Streamlit 右下角 **Manage app → Settings → Secrets**，在最下方新增一行：
-                   `gemini_api_key = "AIzaSy你的免費金鑰"` 並按 Save 即可開始跟 AI 對話！
+                   `gemini_api_key = "你的免費金鑰"` 並按 Save 即可開始跟 AI 對話！
                 """)
             else:
                 st.caption("AI 小助手已自動讀取你們目前的「每日行程表」與「全團收藏清單」，你可以點下方快捷按鈕或直接發問：")
@@ -1341,7 +1424,211 @@ if st.session_state["workspace_area"] == "shared":
                         st.markdown("### 💡 AI 顧問分析報告")
                         st.markdown(ai_reply)
 
-    # --- 共用分頁 1：瀏覽共用清單 ---
+    # --- 共用分頁 1：🗺️ 全景點 ＆ 每日行程互動地圖總覽 ---
+    with tab_map:
+        st.subheader("🗺️ 全景點 ＆ 每日動線互動地圖總覽")
+        st.caption("🔴 美食 ｜ 🟣 購物 ｜ 🟢 景點與地標 ｜ 🔵 交通/住宿（滑鼠移到圓點上或手機點擊可查看店名與車站資訊）")
+
+        map_mode = st.radio(
+            "選擇地圖顯示模式：",
+            [
+                "🌍 全部收藏景點總覽（一眼看清所有美食/購物分佈聚落）",
+                "🗓️ 單日行程動線連線模式（用路線連起當天的每一站）"
+            ],
+            horizontal=True
+        )
+
+        # 模式 A：全部收藏景點總覽
+        if map_mode.startswith("🌍"):
+            if df_links.empty:
+                st.info("目前共用清單還沒有景點喔！快去「➕ 新增連結」加入幾個地點吧。")
+            else:
+                mf1, mf2 = st.columns(2)
+                with mf1:
+                    map_cats = st.multiselect("篩選顯示分類：", CAT_OPTIONS, default=CAT_OPTIONS, key="map_cat_filter")
+                with mf2:
+                    map_regs = st.multiselect("篩選顯示區域：", REGION_OPTIONS, default=REGION_OPTIONS, key="map_reg_filter")
+
+                sub_map_df = df_links[df_links["分類"].isin(map_cats) & df_links["區域"].isin(map_regs)].copy()
+
+                map_points = []
+                unmapped_names = []
+                with st.spinner("🗺️ 正在定位地圖座標..."):
+                    for _, r in sub_map_df.iterrows():
+                        s_name = str(r["自訂名稱"]).strip() or str(r["自動抓取標題"]).strip()
+                        s_url = str(r["網址"]).strip()
+                        s_cat = str(r["分類"]).strip()
+                        s_reg = str(r["區域"]).strip()
+                        s_note = str(r["備註"]).strip()
+
+                        _, s_sub, lat_v, lon_v, _, _ = resolve_place_full(url=s_url, custom_name=s_name, region=s_reg, note=s_note)
+                        if lat_v is not None and lon_v is not None:
+                            map_points.append({
+                                "name": s_name,
+                                "category": s_cat,
+                                "region": s_reg,
+                                "station": s_sub,
+                                "note": s_note if s_note else "無備註",
+                                "lat": lat_v,
+                                "lon": lon_v,
+                                "color": CAT_COLOR_RGBA.get(s_cat, [127, 140, 141, 220])
+                            })
+                        else:
+                            unmapped_names.append(s_name)
+
+                if not map_points:
+                    st.warning("⚠️ 目前篩選的景點尚未取得精準座標（可能是未指定分店的連鎖店）。")
+                else:
+                    df_pts = pd.DataFrame(map_points)
+                    center_lat = float(df_pts["lat"].mean())
+                    center_lon = float(df_pts["lon"].mean())
+
+                    scatter_layer = pdk.Layer(
+                        "ScatterplotLayer",
+                        data=df_pts,
+                        get_position="[lon, lat]",
+                        get_fill_color="color",
+                        get_line_color=[255, 255, 255, 255],
+                        line_width_min_pixels=2,
+                        stroked=True,
+                        get_radius=130,
+                        radius_min_pixels=8,
+                        radius_max_pixels=22,
+                        pickable=True,
+                    )
+
+                    view_state = pdk.ViewState(
+                        latitude=center_lat,
+                        longitude=center_lon,
+                        zoom=12.2,
+                        pitch=0
+                    )
+
+                    tooltip = {
+                        "html": "<b>{name}</b><br/>🏷️ {category} ｜ 🗺️ {region}<br/>🚉 {station}<br/>📝 {note}",
+                        "style": {"backgroundColor": "#1e272e", "color": "white", "fontSize": "13px", "borderRadius": "8px", "padding": "8px"}
+                    }
+
+                    st.pydeck_chart(pdk.Deck(
+                        layers=[scatter_layer],
+                        initial_view_state=view_state,
+                        tooltip=tooltip,
+                        map_style="https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
+                    ))
+                    st.success(f"📍 地圖上已成功標示 **{len(df_pts)}** 個地點！")
+                    if unmapped_names:
+                        st.caption(f"ℹ️ 以下地點因未指定分店或尚無座標，未顯示於地圖上：{', '.join(unmapped_names)}")
+
+        # 模式 B：單日行程動線連線模式
+        else:
+            if df_itin.empty:
+                st.info("目前「每日行程排程」還沒有資料，請先去第一個分頁排入行程喔！")
+            else:
+                df_itin_m = df_itin.copy()
+                df_itin_m["_d_num"] = df_itin_m["天數"].apply(
+                    lambda x: int(re.search(r'\d+', str(x)).group(0)) if re.search(r'\d+', str(x)) else 999
+                )
+                df_itin_m = df_itin_m.sort_values(by=["_d_num", "時間"])
+                avail_days = df_itin_m["天數"].unique().tolist()
+                chosen_map_day = st.selectbox("選擇要檢視動線的天數：", avail_days)
+
+                day_sub = df_itin_m[df_itin_m["天數"] == chosen_map_day].copy()
+                link_meta_map = {}
+                for _, lr in df_links.iterrows():
+                    l_name = str(lr["自訂名稱"]).strip() or str(lr["自動抓取標題"]).strip()
+                    if l_name:
+                        link_meta_map[l_name] = (str(lr["網址"]).strip(), str(lr["區域"]).strip(), str(lr["備註"]).strip())
+
+                day_pts = []
+                with st.spinner(f"🧭 正在繪製 {chosen_map_day} 動線地圖..."):
+                    for seq_idx, (_, r) in enumerate(day_sub.iterrows(), start=1):
+                        s_name = str(r["行程名稱"]).strip()
+                        u_str, reg_str, note_str = link_meta_map.get(s_name, (str(r["網址"]).strip(), "", ""))
+                        _, s_sub, lat_v, lon_v, _, _ = resolve_place_full(url=u_str, custom_name=s_name, region=reg_str, note=note_str)
+                        if lat_v is not None and lon_v is not None:
+                            day_pts.append({
+                                "seq_label": f"第 {seq_idx} 站（{r['時間']}）",
+                                "name": s_name,
+                                "category": str(r["分類"]).strip(),
+                                "station": s_sub,
+                                "note": str(r["備註"]).strip() or "無備註",
+                                "lat": lat_v,
+                                "lon": lon_v,
+                                "color": CAT_COLOR_RGBA.get(str(r["分類"]).strip(), [230, 126, 34, 230])
+                            })
+
+                if not day_pts:
+                    st.warning(f"⚠️ {chosen_map_day} 的行程項目目前無法解析座標，請確認是否為自訂文字或補齊景點名稱。")
+                else:
+                    df_day_pts = pd.DataFrame(day_pts)
+                    layers = []
+
+                    # 若有 2 個以上定點，繪製動線連線
+                    if len(day_pts) >= 2:
+                        path_coords = [[p["lon"], p["lat"]] for p in day_pts]
+                        path_df = pd.DataFrame([{"path": path_coords}])
+                        path_layer = pdk.Layer(
+                            "PathLayer",
+                            data=path_df,
+                            get_path="path",
+                            get_color=[230, 126, 34, 210],
+                            width_scale=1,
+                            width_min_pixels=4,
+                        )
+                        layers.append(path_layer)
+
+                    pts_layer = pdk.Layer(
+                        "ScatterplotLayer",
+                        data=df_day_pts,
+                        get_position="[lon, lat]",
+                        get_fill_color="color",
+                        get_line_color=[255, 255, 255, 255],
+                        line_width_min_pixels=2,
+                        stroked=True,
+                        get_radius=140,
+                        radius_min_pixels=10,
+                        radius_max_pixels=24,
+                        pickable=True,
+                    )
+                    layers.append(pts_layer)
+
+                    view_state_day = pdk.ViewState(
+                        latitude=float(df_day_pts["lat"].mean()),
+                        longitude=float(df_day_pts["lon"].mean()),
+                        zoom=12.5,
+                        pitch=0
+                    )
+
+                    tooltip_day = {
+                        "html": "<b>{seq_label}：{name}</b><br/>🏷️ {category}<br/>🚉 {station}<br/>📝 {note}",
+                        "style": {"backgroundColor": "#1e272e", "color": "white", "fontSize": "13px", "borderRadius": "8px", "padding": "8px"}
+                    }
+
+                    st.pydeck_chart(pdk.Deck(
+                        layers=layers,
+                        initial_view_state=view_state_day,
+                        tooltip=tooltip_day,
+                        map_style="https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
+                    ))
+
+                    # 在地圖下方列出當日各站距離摘要表
+                    if len(day_pts) >= 2:
+                        st.markdown(f"#### 📏 {chosen_map_day} 各站移動距離一覽")
+                        seg_rows = []
+                        total_km = 0.0
+                        for k in range(len(day_pts) - 1):
+                            p1, p2 = day_pts[k], day_pts[k + 1]
+                            dkm = calc_haversine_km(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+                            total_km += dkm
+                            seg_rows.append({
+                                "路段": f"{p1['seq_label']} {p1['name']} ➔ {p2['seq_label']} {p2['name']}",
+                                "直線距離": f"{dkm:.2f} km",
+                                "預估移動時間": estimate_travel_duration(dkm)
+                            })
+                        st.dataframe(pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
+                        st.caption(f"🏁 {chosen_map_day} 全日累計直線移動距離：約 **{total_km:.2f} km**")
+
+    # --- 共用分頁 2：瀏覽共用清單 ---
     with tab1:
         if df_links.empty:
             st.info("目前清單空空如也，快切換到「➕ 新增連結」加入第一個大阪景點吧！")
@@ -1425,7 +1712,7 @@ if st.session_state["workspace_area"] == "shared":
                 }
             )
 
-    # --- 共用分頁 2：路線與距離試算 ---
+    # --- 共用分頁 3：路線與距離試算 ---
     with tab2:
         st.subheader("🧭 路線距離與電車轉乘試算")
         calc_mode = st.radio(
@@ -1636,7 +1923,7 @@ if st.session_state["workspace_area"] == "shared":
                             }
                         )
 
-    # --- 共用分頁 3：新增連結 ---
+    # --- 共用分頁 4：新增連結 ---
     with tab3:
         with st.form("add_link_form", clear_on_submit=True):
             st.subheader("新增景點 / 餐廳 / 購物連結")
@@ -1702,7 +1989,7 @@ if st.session_state["workspace_area"] == "shared":
                             st.success(f"✅ 新增成功！「{fetched_title}」｜{subway_result}")
                             st.rerun()
 
-    # --- 共用分頁 4：修改 / 刪除 ---
+    # --- 共用分頁 5：修改 / 刪除 ---
     with tab4:
         if df_links.empty:
             st.info("目前清單沒有任何資料可以修改或刪除。")
@@ -1768,7 +2055,7 @@ if st.session_state["workspace_area"] == "shared":
                 st.success("✅ 已成功刪除該筆連結！")
                 st.rerun()
 
-    # --- 共用分頁 5：💰 共同支出記帳＆自動分帳計算機 ---
+    # --- 共用分頁 6：💰 共同支出記帳＆自動分帳計算機 ---
     with tab5:
         st.subheader("💰 共同支出記帳區 ＆ 自動分帳計算機")
         live_rate, rate_status, _ = fetch_live_jpy_to_twd()
@@ -1928,7 +2215,7 @@ if st.session_state["workspace_area"] == "shared":
                             for debtor, creditor, amt in twd_transfers:
                                 st.warning(f"💸 **{debtor}** ➔ 轉給 **{creditor}**：**NT$ {amt:,} TWD**")
 
-    # --- 共用分頁 6：匯出精美 Excel ---
+    # --- 共用分頁 7：匯出精美 Excel ---
     with tab6:
         st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、依區域上色分類，並產生包含「每日行程表」、「總表」與各分類分頁的 Excel 檔案。")
         if df_links.empty and df_itin.empty:
