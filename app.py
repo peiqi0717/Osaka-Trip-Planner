@@ -28,12 +28,6 @@ DEFAULT_COLS = ["網址", "分類", "區域", "自訂名稱", "自動抓取標�
 CAT_OPTIONS = ["美食", "購物", "景點與地標", "未分類"]
 REGION_OPTIONS = ["難波/心齋橋", "梅田", "天王寺/阿倍野", "環球影城/港區", "京都/神戶/奈良", "其他/未指定"]
 
-# 大阪地鐵 (Osaka Metro) 路線關鍵字
-OSAKA_METRO_LINES = [
-    "御堂筋線", "谷町線", "四つ橋線", "中央線",
-    "千日前線", "堺筋線", "長堀鶴見緑地線", "今里筋線", "南港ポートタウン線"
-]
-
 # 常見大阪連鎖店關鍵字
 COMMON_CHAINS = [
     "一蘭", "鳥貴族", "唐吉訶德", "唐吉軻德", "驚安殿堂", "激安殿堂",
@@ -54,14 +48,6 @@ BRANCH_INDICATORS = [
     "日本橋", "新世界", "通天閣", "黑門", "京橋", "鶴橋", "中崎町", "北濱",
     "淀屋橋", "本町", "堀江", "美國村", "環球", "天保山", "海遊館", "大阪城",
     "勝尾寺", "箕面", "京都", "神戶", "奈良", "堺", "吹田", "枚方", "高槻", "臨空", "桜塚"
-]
-
-# 百貨與大型商業設施關鍵字（用於從備註提取精準建築座標）
-LANDMARK_BUILDINGS = [
-    "OPA", "PARCO", "大丸", "高島屋", "阪急", "阪神", "LUCUA", "HEP FIVE",
-    "MIO", "Q's MALL", "キューズモール", "阿倍野HARUKAS", "ハルカス", "難波CITY",
-    "なんばCITY", "難波PARKS", "なんばパークス", "GRAND FRONT", "グランフロント",
-    "LINKS UMEDA", "ヨドバシ", "BIC CAMERA", "心斎橋筋", "道頓堀", "黑門市場", "黒門市場"
 ]
 
 # ==========================================
@@ -113,7 +99,7 @@ def save_data(df):
     ws.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
 
 # ==========================================
-# 3. 強化版座標解析與最近地鐵站反查引擎
+# 3. 精準座標解析與全鐵道(地鐵+電鐵+JR)查詢引擎
 # ==========================================
 def is_google_maps_url(url):
     return any(domain in url.lower() for domain in [
@@ -121,8 +107,13 @@ def is_google_maps_url(url):
     ])
 
 def is_valid_kansai_coords(lat, lon):
-    """確認座標位於關西圈合理範圍內"""
-    return (33.0 <= lat <= 36.2) and (134.0 <= lon <= 137.0)
+    """確認座標位於關西圈合理範圍內，並排除大阪府廳預設中心點誤判"""
+    if not ((33.0 <= lat <= 36.2) and (134.0 <= lon <= 137.0)):
+        return False
+    # 排除大阪府廳預設中心點 (34.6863, 135.5197) 避免假天滿橋站
+    if abs(lat - 34.6863) < 0.0012 and abs(lon - 135.5197) < 0.0012:
+        return False
+    return True
 
 def extract_coords_from_text(text):
     """從已解碼的網址或網頁內容提取精準經緯度（優先抓地標座標 !3d!4d）"""
@@ -141,9 +132,7 @@ def extract_coords_from_text(text):
     return None, None
 
 def resolve_google_maps_url(url):
-    """
-    穿透 Google Consent 擋牆並追蹤完整轉跳紀錄，解析 Google 地圖連結的店家名稱與經緯度
-    """
+    """穿透 Google Consent 擋牆並追蹤完整轉跳紀錄，解析 Google 地圖連結的店家名稱與經緯度"""
     title = ""
     lat, lon = None, None
     try:
@@ -151,23 +140,18 @@ def resolve_google_maps_url(url):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Accept-Language': 'ja,zh-TW;q=0.9,en;q=0.8'
         }
-        # 帶入 Google 同意 Cookie，避免雲端伺服器被導向 consent.google.com
         cookies = {
             "CONSENT": "PENDING+987",
             "SOCS": "CAISHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzIaAmphIAEaBgiA_LyaBg"
         }
 
-        # 先檢查原始貼上的網址本身是否已含座標
         raw_decoded = urllib.parse.unquote(url)
         lat, lon = extract_coords_from_text(raw_decoded)
 
         res = requests.get(url, headers=headers, cookies=cookies, timeout=6, allow_redirects=True)
-
-        # 收集所有轉跳歷程與最終網址（解決短網址在轉跳途中才出現座標的情況）
         candidate_urls = [r.url for r in res.history] + [res.url]
         for u in candidate_urls:
             decoded_u = urllib.parse.unquote(u)
-            # 若仍遇到 consent 頁面，拆出 continue= 後面的真實地圖網址
             cont_match = re.search(r'[?&]continue=([^&]+)', decoded_u)
             if cont_match:
                 decoded_u += " " + urllib.parse.unquote(cont_match.group(1))
@@ -180,7 +164,6 @@ def resolve_google_maps_url(url):
             if lat is None:
                 lat, lon = extract_coords_from_text(decoded_u)
 
-        # 若網址本身沒有座標，從網頁原始碼提取
         if lat is None:
             lat, lon = extract_coords_from_text(res.text)
 
@@ -233,70 +216,40 @@ def is_ambiguous_chain(name, region="", note=""):
         return False
     return any(chain.lower() in name.lower() for chain in COMMON_CHAINS)
 
-def build_clean_search_queries(place_name, region="", note=""):
-    """
-    將雜亂的店名與備註拆解成精準的日本地理搜尋詞（移除樓層與干擾字）
-    """
-    queries = []
-    region_map = {
-        "難波/心齋橋": "心斎橋 難波",
-        "梅田": "梅田",
-        "天王寺/阿倍野": "天王寺 阿倍野",
-        "環球影城/港區": "大阪港 桜島",
-        "京都/神戶/奈良": ""
-    }
-    reg_jp = region_map.get(region, "")
-    reg_first = region.split("/")[0] if (region and region != "其他/未指定") else ""
-
-    # 1. 清理店名（去除括號備註與常見中文雜訊）
-    clean_name = re.sub(r'[（(].*?[）)]', '', place_name).strip()
-    if clean_name:
-        if reg_first:
-            queries.append(f"{clean_name} {reg_first}")
-        queries.append(clean_name)
-        if not any(k in clean_name for k in ["大阪", "京都", "神戶", "奈良"]):
-            queries.append(f"大阪府 {clean_name}")
-
-    # 2. 若店名包含「XX本店 / XX店」，拆出中間的地名（例如：いずみかれー桜塚本店 -> 桜塚）
-    branch_loc = re.search(r'([\u4e00-\u9fff]{2,4})(?:本店|支店|店)$', clean_name)
-    if branch_loc:
-        loc_word = branch_loc.group(1)
-        if loc_word not in ["心齋橋", "心斎橋", "道頓堀"]:
-            queries.append(f"大阪府 {loc_word}")
-
-    # 3. 從備註提取明確百貨/大樓名稱（自動去掉「五樓、5F、B1」等樓層字眼）
-    if note:
-        clean_note = re.sub(r'[0-9一二三四五六七八九十B]+[樓層Ff]', '', note).replace("百貨", "").strip()
-        for bld in LANDMARK_BUILDINGS:
-            if bld.lower() in note.lower():
-                if reg_jp:
-                    queries.append(f"{reg_jp} {bld}")
-                queries.append(f"大阪 {bld}")
-        if clean_note and len(clean_note) >= 2 and not any(k in clean_note for k in ["很多分店", "咖哩", "燒肉", "拉麵", "預約"]):
-            if reg_first:
-                queries.append(f"大阪 {reg_first} {clean_note}")
-
-    # 去除重複並保持順序
-    seen = set()
-    unique_queries = []
-    for q in queries:
-        q_norm = q.strip()
-        if q_norm and q_norm not in seen:
-            seen.add(q_norm)
-            unique_queries.append(q_norm)
-    return unique_queries
+def extract_jp_address_from_web(query_str):
+    """透過 DuckDuckGo HTML 搜尋擷取日本真實地址（大阪府/京都府/兵庫縣/奈良縣 + 丁目/番地）"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        }
+        res = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": f"{query_str} 住所 大阪"},
+            headers=headers,
+            timeout=5
+        )
+        # 匹配日本完整門牌地址（例如：大阪府大阪市中央区心斎橋筋1-4-29）
+        addr_match = re.search(
+            r'((?:大阪府|京都府|兵庫県|奈良県)[^\s<>"\'、。]{4,25}[0-9０-９一二三四五六七八九十\-－丁目番地号]+)',
+            res.text
+        )
+        if addr_match:
+            return addr_match.group(1)
+    except Exception:
+        pass
+    return None
 
 def search_coordinates_by_clues(place_name, region="", note=""):
     """
-    多引擎座標反查：
-    1. 若有設定 Google Places API 金鑰則優先使用（最準確）
-    2. 日本國土地理院官方 API (GSI)
-    3. OpenStreetMap Nominatim 精簡關鍵字查詢
+    精準座標反查（嚴格過濾行政區中心點，絕不亂給假座標）：
+    1. 若有設定 Google Places API 金鑰則優先使用
+    2. 透過日本國土地理院 (GSI) 查詢具體地標或反查到的日本門牌地址
+    3. 透過 OpenStreetMap Nominatim 查詢（嚴格排除 city/administrative 行政區中心點）
     """
     if not place_name or place_name in ["未知地點 (需手動確認)", "YouTube 推薦影片"]:
         return None, None
 
-    # 引擎 0（選配）：若 Secrets 有填入 google_maps_api_key，直接呼叫 Google Places API (New)
+    # 引擎 0（選配）：Google Places API
     api_key = st.secrets.get("google_maps_api_key", "").strip()
     if api_key:
         try:
@@ -321,9 +274,21 @@ def search_coordinates_by_clues(place_name, region="", note=""):
         except Exception:
             pass
 
-    queries = build_clean_search_queries(place_name, region, note)
+    reg_first = region.split("/")[0] if (region and region != "其他/未指定") else ""
+    clean_name = re.sub(r'[（(].*?[）)]', '', place_name).strip()
 
-    # 引擎 1：日本國土地理院 (GSI) 官方地址/地標 API（免金鑰、對日本地名與設施極準）
+    # 組合搜尋詞（避免過度拆詞導致抓到整個區公所）
+    queries = []
+    if reg_first:
+        queries.append(f"{clean_name} {reg_first}")
+    queries.append(clean_name)
+
+    # 嘗試從網路搜尋擷取該店真實日本門牌地址，再用國土地理院轉成精準座標
+    jp_addr = extract_jp_address_from_web(f"{clean_name} {reg_first}".strip())
+    if jp_addr:
+        queries.insert(0, jp_addr)
+
+    # 引擎 1：日本國土地理院 (GSI) 官方地址/設施 API
     for q in queries:
         try:
             res = requests.get(
@@ -334,6 +299,10 @@ def search_coordinates_by_clues(place_name, region="", note=""):
             results = res.json()
             if isinstance(results, list) and results:
                 for item in results:
+                    title_prop = item.get("properties", {}).get("title", "")
+                    # 排除只匹配到整個「大阪市」或「大阪府」的寬泛結果
+                    if title_prop in ["大阪府", "大阪府大阪市", "京都府", "兵庫県", "奈良県"]:
+                        continue
                     coords = item.get("geometry", {}).get("coordinates", [])
                     if len(coords) == 2:
                         lon, lat = float(coords[0]), float(coords[1])
@@ -342,18 +311,22 @@ def search_coordinates_by_clues(place_name, region="", note=""):
         except Exception:
             continue
 
-    # 引擎 2：OpenStreetMap Nominatim 精簡查詢
+    # 引擎 2：OpenStreetMap Nominatim（嚴格過濾行政區中心點）
     for q in queries:
         try:
+            search_q = q if any(k in q for k in ["大阪", "京都", "神戶", "奈良"]) else f"{q} 大阪"
             res = requests.get(
                 "https://nominatim.openstreetmap.org/search",
-                params={"q": q, "format": "json", "limit": 3, "countrycodes": "jp"},
-                headers={"User-Agent": "OsakaTripPlannerApp/3.0"},
+                params={"q": search_q, "format": "json", "limit": 3, "countrycodes": "jp"},
+                headers={"User-Agent": "OsakaTripPlannerApp/4.0"},
                 timeout=4
             )
             data = res.json()
             if data:
                 for item in data:
+                    # 關鍵防呆：如果回傳類別是行政區邊界(boundary/administrative)，代表沒找到店面，直接跳過！
+                    if item.get("class") == "boundary" or item.get("type") in ["administrative", "city", "prefecture"]:
+                        continue
                     lat, lon = float(item["lat"]), float(item["lon"])
                     if is_valid_kansai_coords(lat, lon):
                         return lat, lon
@@ -363,20 +336,33 @@ def search_coordinates_by_clues(place_name, region="", note=""):
     return None, None
 
 def format_walking_time(dist_str):
-    """將車站直線距離換算為預估實際步行分鐘數（日本標準 80m/分 × 1.25 街區係數）"""
+    """將車站直線距離換算為實際預估步行分鐘數（日本標準 80m/分 × 1.2 街區係數）"""
     try:
         num_match = re.search(r'(\d+(?:\.\d+)?)', str(dist_str))
         if not num_match:
             return f"約 {dist_str}"
         val = float(num_match.group(1))
         meters = val * 1000 if "km" in str(dist_str).lower() else val
-        walk_mins = max(1, math.ceil((meters * 1.25) / 80))
+        walk_mins = max(1, round((meters * 1.2) / 80))
         return f"步行約 {walk_mins} 分鐘 / {dist_str}"
     except Exception:
         return f"約 {dist_str}"
 
-def query_heartrails_metro(lat, lon):
-    """根據經緯度查詢最近的大阪地鐵站名、路線與步行時間"""
+def clean_line_name(raw_line):
+    """美化日本鐵道路線名稱"""
+    return (
+        raw_line
+        .replace("大阪市高速電気軌道", "Osaka Metro ")
+        .replace("大阪メトロ", "Osaka Metro ")
+        .replace("大阪", "Osaka Metro ")
+        .strip()
+    )
+
+def query_nearest_stations_all(lat, lon):
+    """
+    查詢距離最近的車站（包含 Osaka Metro 地鐵、JR、阪急、阪神、南海、近鐵、京阪全部電鐵），
+    並自動合併同站多條交會路線，避免捨近求遠。
+    """
     try:
         res = requests.get(
             "https://express.heartrails.com/api/json",
@@ -387,31 +373,34 @@ def query_heartrails_metro(lat, lon):
         if not stations:
             return "查無鄰近車站"
 
-        metro_stations = [
-            s for s in stations
-            if any(line_kw in s.get("line", "") for line_kw in OSAKA_METRO_LINES)
-            and ("大阪" in s.get("line", "") or "Osaka" in s.get("line", ""))
-        ]
+        # 直接取距離最近的第一個車站（不論地鐵或電鐵，絕不捨近求遠走50分鐘）
+        nearest = stations[0]
+        nearest_name = nearest.get("name", "")
+        walk_text = format_walking_time(nearest.get("distance", ""))
 
-        if metro_stations:
-            nearest = metro_stations[0]
-            st_name = nearest.get("name", "")
-            walk_text = format_walking_time(nearest.get("distance", ""))
+        # 收集距離該點 350 公尺內的所有車站與路線（涵蓋梅田/難波等共構與鄰近轉乘站）
+        nearby_lines = []
+        for s in stations:
+            s_name = s.get("name", "")
+            dist_str = str(s.get("distance", ""))
+            num_m = re.search(r'(\d+(?:\.\d+)?)', dist_str)
+            meters = 9999
+            if num_m:
+                v = float(num_m.group(1))
+                meters = v * 1000 if "km" in dist_str.lower() else v
 
-            same_st_lines = []
-            for s in metro_stations:
-                if s.get("name") == st_name:
-                    clean_line = s.get("line", "").replace("大阪", "Osaka Metro ")
-                    if clean_line not in same_st_lines:
-                        same_st_lines.append(clean_line)
-            lines_str = " / ".join(same_st_lines)
-            return f"🚇 {st_name}站（{lines_str}，{walk_text}）"
+            # 同站名一律收錄所有路線；若在 250m 內的其他同名/共構站也一併列出
+            if s_name == nearest_name or meters <= 250:
+                line_label = clean_line_name(s.get("line", ""))
+                entry = line_label if s_name == nearest_name else f"{s_name}站-{line_label}"
+                if entry not in nearby_lines:
+                    nearby_lines.append(entry)
 
-        fallback = stations[0]
-        walk_text = format_walking_time(fallback.get("distance", ""))
-        return f"🚃 {fallback.get('name', '')}站（{fallback.get('line', '')}・非地鐵，{walk_text}）"
+        lines_str = " / ".join(nearby_lines[:4])  # 最多顯示 4 條主要路線避免過長
+        icon = "🚇" if "Osaka Metro" in lines_str else "🚃"
+        return f"{icon} {nearest_name}站（{lines_str}，{walk_text}）"
     except Exception:
-        return "地鐵查詢逾時（可稍後補抓）"
+        return "車站查詢逾時（可稍後補抓）"
 
 def resolve_place_and_subway(url, custom_name="", region="", note=""):
     final_title = custom_name.strip()
@@ -429,15 +418,15 @@ def resolve_place_and_subway(url, custom_name="", region="", note=""):
         lat, lon = w_lat, w_lon
 
     if lat is None and is_ambiguous_chain(final_title, region, note):
-        return final_title, "⏭️ 疑有多家分店（未指定分店或區域，不自動匹配地鐵）"
+        return final_title, "⏭️ 疑有多家分店（未指定分店或區域，不自動匹配車站）"
 
     if lat is None or lon is None:
         lat, lon = search_coordinates_by_clues(final_title, region, note)
 
     if lat is not None and lon is not None:
-        subway_info = query_heartrails_metro(lat, lon)
+        subway_info = query_nearest_stations_all(lat, lon)
     else:
-        subway_info = "查無單一店面座標（建議補貼 Google 地圖連結）"
+        subway_info = "⚠️ 未取得精準座標（建議貼 Google 地圖分享連結，或於修改頁手動輸入車站）"
 
     return final_title, subway_info
 
@@ -449,7 +438,7 @@ def generate_styled_excel(df_links):
     food_list, shop_list, spot_list, other_list = [], [], [], []
     sheet_updated = False
 
-    progress_bar = st.progress(0, text="🔍 正在解析座標、最近地鐵站與步行時間...")
+    progress_bar = st.progress(0, text="🔍 正在解析座標、最近車站(地鐵/電鐵)與步行時間...")
     total_rows = len(df_links)
 
     for index, row in df_links.iterrows():
@@ -463,7 +452,7 @@ def generate_styled_excel(df_links):
         cached_title = str(row["自動抓取標題"]).strip()
         subway_info = str(row["最近地鐵站"]).strip()
 
-        need_retry = (not subway_info) or subway_info.startswith(("查無", "未取得", "地鐵查詢逾時", "非地圖連結"))
+        need_retry = (not subway_info) or subway_info.startswith(("查無", "未取得", "地鐵查詢逾時", "車站查詢逾時", "非地圖連結", "⚠️"))
         if (not cached_title and not custom_name) or need_retry:
             resolved_title, resolved_subway = resolve_place_and_subway(url, custom_name, region, note)
             final_title = custom_name if custom_name else (cached_title if cached_title else resolved_title)
@@ -487,7 +476,7 @@ def generate_styled_excel(df_links):
         spot_data = {
             "區域/商圈": region,
             "名稱/標題": final_title,
-            "最近地鐵站": subway_info,
+            "最近車站(地鐵/電鐵)": subway_info,
             "網址": url,
             "Google地圖導航": gmap_url,
             "備註": note,
@@ -499,7 +488,7 @@ def generate_styled_excel(df_links):
             "分類": category,
             "區域/商圈": region,
             "名稱/標題": final_title,
-            "最近地鐵站": subway_info,
+            "最近車站(地鐵/電鐵)": subway_info,
             "備註": note,
             "Google地圖導航": gmap_url,
             "網址": url,
@@ -618,7 +607,7 @@ def generate_styled_excel(df_links):
                     char_len = sum(2 if ord(ch) > 127 else 1 for ch in val_str)
                     if char_len > max_len:
                         max_len = char_len
-                adjusted_width = min(max(max_len + 4, 12), 48)
+                adjusted_width = min(max(max_len + 4, 12), 50)
                 ws.column_dimensions[col_letter].width = adjusted_width
 
     output.seek(0)
@@ -660,17 +649,40 @@ with tab1:
     if df_links.empty:
         st.info("目前清單空空如也，快切換到「➕ 新增連結」加入第一個大阪景點吧！")
     else:
-        def needs_subway_lookup(val):
-            s = str(val).strip()
-            return (not s) or s.startswith(("查無", "未取得", "地鐵查詢逾時", "非地圖連結", "⏭️"))
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            def needs_subway_lookup(val):
+                s = str(val).strip()
+                return (not s) or s.startswith(("查無", "未取得", "地鐵查詢逾時", "車站查詢逾時", "非地圖連結", "⏭️", "⚠️")) or ("天滿橋" in s)
 
-        retry_mask = df_links["最近地鐵站"].apply(needs_subway_lookup)
-        retry_count = int(retry_mask.sum())
-        if retry_count > 0:
-            if st.button(f"🚇 一鍵為 {retry_count} 筆資料重新反查最近地鐵站", type="secondary"):
-                prog = st.progress(0, text="🚇 正在解析座標與計算步行分鐘數...")
-                retry_indices = df_links[retry_mask].index.tolist()
-                for i, idx in enumerate(retry_indices):
+            retry_mask = df_links["最近地鐵站"].apply(needs_subway_lookup)
+            retry_count = int(retry_mask.sum())
+            if retry_count > 0:
+                if st.button(f"🚇 修正/補查 {retry_count} 筆資料的最近車站", type="primary", use_container_width=True):
+                    prog = st.progress(0, text="🚇 正在重新精準反查最近車站（地鐵/電鐵/JR）...")
+                    retry_indices = df_links[retry_mask].index.tolist()
+                    for i, idx in enumerate(retry_indices):
+                        row = df_links.loc[idx]
+                        c_name = str(row["自訂名稱"]).strip() or str(row["自動抓取標題"]).strip()
+                        resolved_title, resolved_subway = resolve_place_and_subway(
+                            str(row["網址"]).strip(),
+                            c_name,
+                            str(row["區域"]).strip(),
+                            str(row["備註"]).strip()
+                        )
+                        if not str(row["自動抓取標題"]).strip():
+                            df_links.at[idx, "自動抓取標題"] = c_name if c_name else resolved_title
+                        df_links.at[idx, "最近地鐵站"] = resolved_subway
+                        prog.progress((i + 1) / len(retry_indices))
+                    prog.empty()
+                    save_data(df_links)
+                    st.success("✅ 已完成車站與步行時間更新！")
+                    st.rerun()
+
+        with btn_col2:
+            if st.button("🔄 全部重新查詢最近車站（地鐵+電鐵）", type="secondary", use_container_width=True):
+                prog = st.progress(0, text="🚇 正在全部重新解析座標與最近車站...")
+                for i, idx in enumerate(df_links.index.tolist()):
                     row = df_links.loc[idx]
                     c_name = str(row["自訂名稱"]).strip() or str(row["自動抓取標題"]).strip()
                     resolved_title, resolved_subway = resolve_place_and_subway(
@@ -682,10 +694,10 @@ with tab1:
                     if not str(row["自動抓取標題"]).strip():
                         df_links.at[idx, "自動抓取標題"] = c_name if c_name else resolved_title
                     df_links.at[idx, "最近地鐵站"] = resolved_subway
-                    prog.progress((i + 1) / len(retry_indices))
+                    prog.progress((i + 1) / len(df_links))
                 prog.empty()
                 save_data(df_links)
-                st.success("✅ 已完成地鐵站與步行時間更新！")
+                st.success("✅ 全部資料已重新更新完成！")
                 st.rerun()
 
         f_col1, f_col2 = st.columns(2)
@@ -702,11 +714,11 @@ with tab1:
             lambda r: r["自訂名稱"] if str(r["自訂名稱"]).strip() else (r["自動抓取標題"] if str(r["自動抓取標題"]).strip() else "(尚未解析名稱)"),
             axis=1
         )
-        filtered_df["最近地鐵站"] = filtered_df["最近地鐵站"].apply(
+        filtered_df["最近車站(地鐵/電鐵)"] = filtered_df["最近地鐵站"].apply(
             lambda x: x if str(x).strip() else "(尚未查詢)"
         )
 
-        display_df = filtered_df[["分類", "區域", "顯示名稱", "最近地鐵站", "備註", "網址", "新增者"]]
+        display_df = filtered_df[["分類", "區域", "顯示名稱", "最近車站(地鐵/電鐵)", "備註", "網址", "新增者"]]
         st.dataframe(
             display_df,
             use_container_width=True,
@@ -721,7 +733,7 @@ with tab2:
     with st.form("add_link_form", clear_on_submit=True):
         st.subheader("新增景點 / 餐廳 / 購物連結")
         raw_input = st.text_input("🔗 貼上網址（支援 Google Maps、IG、食記或一般網頁）*", placeholder="https://...")
-        c_name = st.text_input("✏️ 自訂中文名稱（選填；系統會結合區域與備註自動反查位置）", placeholder="例如：一蘭拉麵 道頓堀店")
+        c_name = st.text_input("✏️ 自訂中文/日文名稱（選填；系統會自動搜尋地址並計算最近地鐵與電鐵）", placeholder="例如：一蘭拉麵 道頓堀店")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -729,7 +741,7 @@ with tab2:
         with c2:
             chosen_region = st.selectbox("🗺️ 區域 / 商圈", REGION_OPTIONS)
 
-        note_text = st.text_input("📝 備註（選填；填入百貨或建築物名稱如「OPA百貨 五樓」可大幅提升定位準確度）", placeholder="例如：OPA百貨 五樓、必點牛舌")
+        note_text = st.text_input("📝 備註（選填）", placeholder="例如：OPA百貨 五樓、必點牛舌")
         submitted = st.form_submit_button("✅ 加入共用清單", type="primary")
 
         if submitted:
@@ -758,7 +770,7 @@ with tab2:
                         dup_name = dup_row["自訂名稱"] if str(dup_row["自訂名稱"]).strip() else "(無自訂名稱)"
                         st.warning(f"⚠️ 此網址已存在清單中！（名稱：{dup_name} ｜ 推薦人：{dup_row['新增者']} 於 {dup_row['新增時間']} 新增）")
                     else:
-                        with st.spinner("🔍 正在解析地點座標並計算最近地鐵站與步行時間..."):
+                        with st.spinner("🔍 正在解析地點座標並計算最近車站(地鐵/電鐵)與步行時間..."):
                             fetched_title, subway_result = resolve_place_and_subway(
                                 extracted_url,
                                 c_name.strip(),
@@ -809,8 +821,8 @@ with tab3:
                 reg_idx = REGION_OPTIONS.index(target_row["區域"]) if target_row["區域"] in REGION_OPTIONS else 5
                 edit_region = st.selectbox("🗺️ 區域 / 商圈", REGION_OPTIONS, index=reg_idx)
 
-            edit_subway = st.text_input("🚇 最近地鐵站（可手動填寫，或勾選下方重新反查）", value=str(target_row["最近地鐵站"]))
-            recheck_subway = st.checkbox("🔄 儲存時重新反查最近大阪地鐵站")
+            edit_subway = st.text_input("🚇 最近車站（可手動填寫，或勾選下方重新反查）", value=str(target_row["最近地鐵站"]))
+            recheck_subway = st.checkbox("🔄 儲存時重新反查最近車站（地鐵+電鐵）")
             edit_note = st.text_input("📝 備註", value=str(target_row["備註"]))
 
             save_edit = st.form_submit_button("💾 儲存修改", type="primary")
@@ -852,7 +864,7 @@ with tab3:
 
 # --- 分頁 4：匯出精美 Excel ---
 with tab4:
-    st.write("點擊下方按鈕，系統會自動補查尚未解析的最近地鐵站、依區域上色分類，並產生包含「總表」與各分類分頁的 Excel 檔案。")
+    st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、依區域上色分類，並產生包含「總表」與各分類分頁的 Excel 檔案。")
     if df_links.empty:
         st.info("目前沒有資料可以匯出喔！")
     else:
