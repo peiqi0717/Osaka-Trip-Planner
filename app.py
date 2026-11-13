@@ -32,6 +32,7 @@ EXPENSE_COLS = ["日期時間", "項目名稱", "幣別", "金額", "付款人",
 SHOPPING_COLS = ["擁有者", "商品名稱", "分類", "購買地點", "日幣金額", "幫誰買", "已買到", "備註"]
 PACKING_COLS = ["擁有者", "分類", "物品名稱", "數量", "已打包"]
 ITINERARY_COLS = ["天數", "日期", "時間", "行程名稱", "分類", "最近車站", "網址", "備註", "排程者"]
+HOTEL_COLS = ["飯店名稱", "網址", "入住日期", "入住時間", "退房日期", "退房時間", "最近車站", "訂房備註", "新增者"]
 META_COLS = ["設定鍵", "設定值"]
 
 CAT_OPTIONS = ["美食", "購物", "景點與地標", "交通/住宿", "未分類"]
@@ -45,10 +46,10 @@ CAT_COLOR_RGBA = {
     "購物": [155, 89, 182, 235],        # 亮紫色
     "景點與地標": [39, 174, 96, 235],   # 翠綠色
     "交通/住宿": [41, 128, 185, 235],   # 寶藍色
+    "住宿飯店": [241, 196, 15, 245],    # 金黃色（飯店專屬醒目標記）
     "未分類": [127, 140, 141, 235]      # 鐵灰色
 }
 
-# 內建 SVG 向量地圖圖釘圖示（無需外部圖檔即可渲染清晰圖釘）
 PIN_SVG = """
 <svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
   <path d="M32 4C19.85 4 10 13.85 10 26C10 42.5 32 60 32 60C32 60 54 42.5 54 26C54 13.85 44.15 4 32 4Z" fill="white" stroke="#2c3e50" stroke-width="3"/>
@@ -62,7 +63,7 @@ PIN_ICON_SPEC = {
     "width": 64,
     "height": 64,
     "anchorY": 60,
-    "mask": True  # 自動套用各分類的顏色
+    "mask": True
 }
 
 DEFAULT_PACKING_TEMPLATE = [
@@ -99,7 +100,6 @@ BRANCH_INDICATORS = [
 ]
 
 def build_map_marker_layer(df_points, marker_style, is_day_route=False):
-    """根據使用者選擇產生『精緻小圓點』或『📍 經典地圖圖釘』圖層"""
     if marker_style.startswith("📍"):
         df_icon = df_points.copy()
         df_icon["icon_data"] = [PIN_ICON_SPEC] * len(df_icon)
@@ -245,6 +245,30 @@ def save_trip_dates(start_date, end_date):
     ])
     save_sheet_df(ws_meta, df_meta, META_COLS)
 
+def get_hotel_events_for_date(df_hotels, target_date):
+    """根據指定日期，找出當日退房、當日入住、或當晚續住的飯店資訊"""
+    checkouts = []
+    checkins = []
+    staying = []
+    if df_hotels is None or df_hotels.empty:
+        return checkouts, checkins, staying
+
+    for _, h in df_hotels.iterrows():
+        try:
+            ci_d = datetime.date.fromisoformat(str(h["入住日期"]).strip())
+            co_d = datetime.date.fromisoformat(str(h["退房日期"]).strip())
+        except Exception:
+            continue
+
+        if target_date == co_d:
+            checkouts.append(h)
+        if target_date == ci_d:
+            checkins.append(h)
+        if ci_d <= target_date < co_d:
+            staying.append(h)
+
+    return checkouts, checkins, staying
+
 # ==========================================
 # 4. 帳號驗證、分帳與 AI 助手工具
 # ==========================================
@@ -356,7 +380,7 @@ def calculate_combined_twd_settlements(df_exp, jpy_to_twd_rate):
 
     return _solve_debt_graph(paid_map, owed_map)
 
-def ask_travel_ai_assistant(user_prompt, df_itin, df_links, trip_days_info):
+def ask_travel_ai_assistant(user_prompt, df_itin, df_links, df_hotels, trip_days_info):
     gemini_key = st.secrets.get("gemini_api_key", "").strip()
     if not gemini_key:
         return "⚠️ 尚未設定 `gemini_api_key`！請在 Streamlit Secrets 貼上免費的 Google AI Studio API Key 即可啟用 AI 旅遊小助手。"
@@ -364,6 +388,15 @@ def ask_travel_ai_assistant(user_prompt, df_itin, df_links, trip_days_info):
     try:
         from google import genai
         client = genai.Client(api_key=gemini_key)
+
+        hotel_text = "（尚未登錄預訂飯店）"
+        if df_hotels is not None and not df_hotels.empty:
+            h_lines = []
+            for _, h in df_hotels.iterrows():
+                h_lines.append(
+                    f"- {h['飯店名稱']}｜入住：{h['入住日期']} {h['入住時間']} ～ 退房：{h['退房日期']} {h['退房時間']}｜最近車站：{h['最近車站']}｜備註：{h['訂房備註']}"
+                )
+            hotel_text = "\n".join(h_lines)
 
         itin_text = "（目前尚未排入任何每日行程）"
         if not df_itin.empty:
@@ -386,10 +419,13 @@ def ask_travel_ai_assistant(user_prompt, df_itin, df_links, trip_days_info):
 
         system_context = f"""
 你是一位專業、貼心且熟悉日本大阪、京都、神戶、奈良自由行的「AI 旅遊規劃小助手」。
-請根據以下這組旅客的真實行程與收藏清單，用繁體中文給出具體、實用、條理分明的建議（包含地鐵/電鐵路線順暢度、是否走回頭路、營業時間/排隊提醒、體力分配建議等）。
+請根據以下這組旅客的真實住宿飯店、行程與收藏清單，用繁體中文給出具體、實用、條理分明的建議（包含每天從住宿飯店出發/返回是否順路、換飯店日的行李寄放與移動建議、營業時間/排隊提醒等）。
 
 【旅程天數資訊】
 {trip_days_info}
+
+【已預訂的住宿飯店（含入住與退房時間）】
+{hotel_text}
 
 【目前已排入的每日行程表】
 {itin_text}
@@ -764,15 +800,15 @@ def build_route_comparison_row(orig_obj, dest_obj):
     }
 
 # ==========================================
-# 6. 產生美化 Excel 報表（含每日行程表分頁）
+# 6. 產生美化 Excel 報表（含每日行程表與住宿飯店分頁）
 # ==========================================
-def generate_styled_excel(df_links, df_itin=None):
+def generate_styled_excel(df_links, df_itin=None, df_hotels=None):
     all_list = []
     food_list, shop_list, spot_list, other_list = [], [], [], []
     sheet_updated = False
 
     progress_bar = st.progress(0, text="🔍 正在透過 Google API 解析座標與最近車站...")
-    total_rows = len(df_links)
+    total_rows = max(1, len(df_links))
 
     for index, row in df_links.iterrows():
         url = str(row["網址"]).strip()
@@ -874,6 +910,11 @@ def generate_styled_excel(df_links, df_itin=None):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         sheets_written = []
+        if df_hotels is not None and not df_hotels.empty:
+            df_hotels_sorted = df_hotels.sort_values(by=["入住日期"]).copy()
+            df_hotels_sorted.to_excel(writer, sheet_name="🏨 住宿飯店表", index=False)
+            sheets_written.append("🏨 住宿飯店表")
+
         if df_itin is not None and not df_itin.empty:
             df_itin_sorted = df_itin.sort_values(by=["天數", "時間"]).copy()
             df_itin_sorted.to_excel(writer, sheet_name="📅 每日行程表", index=False)
@@ -1042,11 +1083,12 @@ if st.session_state["workspace_area"] is None:
             st.write("所有同行夥伴共同編輯與查詢的旅遊大本營：")
             st.markdown("""
             * 📅 **每日行程排程器 ＆ AI 顧問**：日曆排程、相鄰景點距離自動提示、AI 路線健檢
-            * 🗺️ **全景點互動地圖總覽**：支援小圓點 / 地圖圖釘切換，檢視所有景點分佈與單日動線
+            * 🏨 **住宿飯店管理**：支援單間或多間換飯店、入住/退房詳細時間與全站自動連動
+            * 🗺️ **全景點互動地圖總覽**：支援小圓點 / 地圖圖釘切換，檢視景點、飯店與單日動線
             * 📋 **共用旅遊清單**：瀏覽所有美食、購物、景點與最近車站
-            * 🧭 **路線與距離試算**：飯店/機場雙向路線、任意兩定點對比
+            * 🧭 **路線與距離試算**：一鍵套用已訂飯店雙向路線、任意兩定點對比
             * 💰 **共同支出＆分帳計算機**：記錄代墊款項，即時匯率合併結算誰給誰錢
-            * 📊 **匯出精美 Excel**：含每日行程表與各分類上色分頁
+            * 📊 **匯出精美 Excel**：含住宿飯店表、每日行程表與各分類上色分頁
             """)
             st.write("")
             if st.button("🌍 進入【大家共用區】", type="primary", use_container_width=True):
@@ -1062,6 +1104,7 @@ if st.session_state["workspace_area"] is None:
             * 💱 **即時市場匯率換算**：自動抓取最新日幣匯率，勾選「已買到 ✅」即時統計花費
             * 🧳 **個人行李打包清單**：一鍵匯入日本自由行常用清單並勾選確認
             """)
+            st.write("")
             st.write("")
             st.write("")
             st.write("")
@@ -1105,12 +1148,16 @@ st.divider()
 # ==============================================================================
 if st.session_state["workspace_area"] == "shared":
     df_links = load_data()
+    ws_hotels = get_or_create_ws("住宿飯店", HOTEL_COLS)
+    df_hotels = load_sheet_df(ws_hotels, HOTEL_COLS)
+
     has_gmap_key = bool(st.secrets.get("google_maps_api_key", "").strip())
     key_badge = "✅ Google 地圖 API 已連線" if has_gmap_key else "⚠️ 尚未偵測到 Google 地圖 API 金鑰"
-    st.caption(f"📊 目前共收錄 **{len(df_links)}** 筆景點與美食 ｜ {key_badge} ｜ [📄 開啟 Google 雲端試算表]({st.secrets['sheet_url']})")
+    st.caption(f"📊 目前共收錄 **{len(df_links)}** 筆景點與美食 ｜ 🏨 已預訂 **{len(df_hotels)}** 間飯店 ｜ {key_badge} ｜ [📄 開啟 Google 雲端試算表]({st.secrets['sheet_url']})")
 
-    tab_itin, tab_map, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab_itin, tab_hotel, tab_map, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📅 每日行程排程 ＆ AI 顧問",
+        "🏨 住宿飯店管理",
         "🗺️ 互動地圖總覽",
         "📋 共用旅遊清單",
         "🧭 路線與距離試算",
@@ -1156,6 +1203,7 @@ if st.session_state["workspace_area"] == "shared":
 
         day_options = []
         day_date_map = {}
+        day_date_obj_map = {}
         for d_idx in range(total_days):
             cur_d = active_start + timedelta(days=d_idx)
             w_str = WEEKDAY_ZH[cur_d.weekday()]
@@ -1163,6 +1211,7 @@ if st.session_state["workspace_area"] == "shared":
             full_label = f"{day_tag}（{cur_d.strftime('%m/%d')} {w_str}）"
             day_options.append(full_label)
             day_date_map[full_label] = (day_tag, f"{cur_d.strftime('%Y-%m-%d')} ({w_str})")
+            day_date_obj_map[day_tag] = cur_d
 
         with st.container(border=True):
             st.markdown("**步驟 2️⃣：將景點或活動排入行程**")
@@ -1170,7 +1219,7 @@ if st.session_state["workspace_area"] == "shared":
             with opt_c1:
                 add_source = st.radio(
                     "選擇加入方式：",
-                    ["📋 從「共用旅遊清單」挑選景點", "✏️ 手動輸入自訂行程（如：搭飛機、飯店 Check-in）"],
+                    ["📋 從「共用旅遊清單」挑選景點", "✏️ 手動輸入自訂行程（如：搭飛機、逛街、自由時間）"],
                     horizontal=True
                 )
             with opt_c2:
@@ -1210,7 +1259,7 @@ if st.session_state["workspace_area"] == "shared":
                     in_note = st.text_input("行程備註（選填）", placeholder="例如：已訂位 18:30、記得先抽整理券")
                 else:
                     with ic3:
-                        custom_itin_name = st.text_input("行程 / 活動名稱 *", placeholder="例如：抵達關西機場、飯店寄放行李、心齋橋自由購物")
+                        custom_itin_name = st.text_input("行程 / 活動名稱 *", placeholder="例如：抵達關西機場、心齋橋自由購物")
                     ic4, ic5 = st.columns([2, 4])
                     with ic4:
                         custom_itin_cat = st.selectbox("分類", CAT_OPTIONS)
@@ -1271,13 +1320,13 @@ if st.session_state["workspace_area"] == "shared":
         with view_c1:
             view_mode = st.radio(
                 "👀 選擇行程呈現模式：",
-                ["⏳ 時間軸卡片模式（含相鄰景點距離自動計算）", "📊 總覽表格模式（一眼看全趟行程表）"],
+                ["⏳ 時間軸卡片模式（含相鄰景點距離與住宿提示）", "📊 總覽表格模式（一眼看全趟行程表）"],
                 horizontal=True
             )
         with view_c2:
             filter_day_choice = st.selectbox("篩選檢視天數：", ["全部天數總覽"] + day_options)
 
-        if df_itin.empty:
+        if df_itin.empty and df_hotels.empty:
             st.info("目前行程表還是空的，快從上方步驟 2 開始把景點排進每一天吧！")
         else:
             df_itin["_day_num"] = df_itin["天數"].apply(
@@ -1305,10 +1354,59 @@ if st.session_state["workspace_area"] == "shared":
                         date_label = group.iloc[0]["日期"]
                         st.markdown(f"### 🗓️ {day_tag} ｜ {date_label}")
 
+                        # 自動顯示當日住宿飯店動態橫幅（退房、入住、今晚續住）
+                        cur_date_obj = day_date_obj_map.get(day_tag)
+                        if cur_date_obj and not df_hotels.empty:
+                            co_list, ci_list, stay_list = get_hotel_events_for_date(df_hotels, cur_date_obj)
+                            hotel_msgs = []
+                            for h in co_list:
+                                hotel_msgs.append(f"🧳 **上午退房**：{h['飯店名稱']}（退房時間 `{h['退房時間']}`）")
+                            for h in ci_list:
+                                hotel_msgs.append(f"🔑 **下午入住**：{h['飯店名稱']}（入住時間 `{h['入住時間']}`｜{h['最近車站']}）")
+                            if not ci_list and stay_list:
+                                h = stay_list[0]
+                                hotel_msgs.append(f"🏨 **今晚下榻飯店**：{h['飯店名稱']}（{h['最近車站']}）")
+
+                            if hotel_msgs:
+                                h_col1, h_col2 = st.columns([4, 1.5])
+                                with h_col1:
+                                    st.info(" ｜ ".join(hotel_msgs))
+                                with h_col2:
+                                    if ci_list or co_list:
+                                        if st.button(f"➕ 一鍵把入住/退房排入 {day_tag}", key=f"auto_add_hotel_{day_tag}", use_container_width=True):
+                                            added_rows = []
+                                            for h in co_list:
+                                                added_rows.append({
+                                                    "天數": day_tag,
+                                                    "日期": date_label,
+                                                    "時間": str(h["退房時間"]).strip() or "11:00",
+                                                    "行程名稱": f"🏨 飯店退房：{h['飯店名稱']}",
+                                                    "分類": "交通/住宿",
+                                                    "最近車站": str(h["最近車站"]).strip(),
+                                                    "網址": str(h["網址"]).strip(),
+                                                    "備註": str(h["訂房備註"]).strip(),
+                                                    "排程者": current_user
+                                                })
+                                            for h in ci_list:
+                                                added_rows.append({
+                                                    "天數": day_tag,
+                                                    "日期": date_label,
+                                                    "時間": str(h["入住時間"]).strip() or "15:00",
+                                                    "行程名稱": f"🔑 飯店入住：{h['飯店名稱']}",
+                                                    "分類": "交通/住宿",
+                                                    "最近車站": str(h["最近車站"]).strip(),
+                                                    "網址": str(h["網址"]).strip(),
+                                                    "備註": str(h["訂房備註"]).strip(),
+                                                    "排程者": current_user
+                                                })
+                                            df_itin_clean = df_itin.drop(columns=["_day_num"], errors="ignore")
+                                            df_itin_clean = pd.concat([df_itin_clean, pd.DataFrame(added_rows)], ignore_index=True)
+                                            save_sheet_df(ws_itin, df_itin_clean, ITINERARY_COLS)
+                                            st.rerun()
+
                         places_for_route = [
-                            urllib.parse.quote(f"大阪 {str(row['行程名稱']).strip()}")
+                            urllib.parse.quote(f"大阪 {str(row['行程名稱']).replace('🏨 飯店退房：', '').replace('🔑 飯店入住：', '').strip()}")
                             for _, row in group.iterrows()
-                            if str(row["分類"]).strip() != "交通/住宿" or len(group) <= 2
                         ]
                         if len(places_for_route) >= 2:
                             origin_p = places_for_route[0]
@@ -1325,7 +1423,7 @@ if st.session_state["workspace_area"] == "shared":
                         group_items = list(group.iterrows())
                         resolved_coords_list = []
                         for _, r_item in group_items:
-                            s_n = str(r_item["行程名稱"]).strip()
+                            s_n = str(r_item["行程名稱"]).replace("🏨 飯店退房：", "").replace("🔑 飯店入住：", "").strip()
                             u_str, reg_str, note_str = link_meta_map.get(s_n, (str(r_item["網址"]).strip(), "", ""))
                             _, _, lat_v, lon_v, _, st_lines_v = resolve_place_full(url=u_str, custom_name=s_n, region=reg_str, note=note_str)
                             resolved_coords_list.append((lat_v, lon_v, st_lines_v))
@@ -1430,15 +1528,15 @@ if st.session_state["workspace_area"] == "shared":
                    `gemini_api_key = "你的免費金鑰"` 並按 Save 即可開始跟 AI 對話！
                 """)
             else:
-                st.caption("AI 小助手已自動讀取你們目前的「每日行程表」與「全團收藏清單」，你可以點下方快捷按鈕或直接發問：")
+                st.caption("AI 小助手已自動讀取你們的「住宿飯店資訊」、「每日行程表」與「全團收藏清單」，你可以點下方快捷按鈕或直接發問：")
                 q_b1, q_b2, q_b3 = st.columns(3)
                 quick_ai_prompt = ""
                 with q_b1:
                     if st.button("🔍 幫我健檢目前排程順不順？", use_container_width=True):
-                        quick_ai_prompt = "請幫我檢查目前已經排入的每日行程，分析每天的交通路線是否順路、有沒有走回頭路、時間會不會太趕或太鬆，並給出具體調整建議。"
+                        quick_ai_prompt = "請結合我們預訂的住宿飯店位置與入住退房時間，檢查目前已經排入的每日行程，分析每天從飯店出發與返回的交通是否順路、有沒有走回頭路、換飯店當天行李怎麼處理最順，並給出具體調整建議。"
                 with q_b2:
                     if st.button("🧩 還沒排的景點怎麼塞進空檔？", use_container_width=True):
-                        quick_ai_prompt = "請比對『已排入的每日行程』與『全團收藏清單中還沒排進去的景點/美食』，幫我推薦哪些未排入的店剛好順路可以塞進哪一天的空檔？"
+                        quick_ai_prompt = "請比對『已排入的每日行程』、『住宿飯店周邊』與『全團收藏清單中還沒排進去的景點/美食』，幫我推薦哪些未排入的店剛好順路可以塞進哪一天的空檔？"
                 with q_b3:
                     if st.button("🌧️ 幫我規劃雨天備案與排隊提醒", use_container_width=True):
                         quick_ai_prompt = "針對我們目前的行程與收藏清單，請問有哪些餐廳需要提前預約或排隊很久？如果遇到下雨天，哪幾天的行程需要準備室內雨天備案？"
@@ -1447,7 +1545,7 @@ if st.session_state["workspace_area"] == "shared":
                     "💬 或者直接輸入你想問 AI 小助手的問題：",
                     value=quick_ai_prompt,
                     height=90,
-                    placeholder="例如：Day 2 早上想去環球影城，晚上還排得下心齋橋吃燒肉嗎？車程大概要多久？"
+                    placeholder="例如：換飯店那天早上退房後，把行李寄放在哪個車站最順路？"
                 )
 
                 if st.button("✨ 請 AI 小助手分析建議", type="primary"):
@@ -1455,27 +1553,186 @@ if st.session_state["workspace_area"] == "shared":
                         st.warning("⚠️ 請先輸入問題或點擊上方快捷按鈕喔！")
                     else:
                         trip_info_str = f"{active_start.strftime('%Y/%m/%d')} 至 {active_end.strftime('%Y/%m/%d')}（共 {total_days} 天）"
-                        with st.spinner("🤖 AI 小助手正在比對所有景點車站與行程動線中..."):
+                        with st.spinner("🤖 AI 小助手正在比對住宿飯店、所有景點車站與行程動線中..."):
                             ai_reply = ask_travel_ai_assistant(
                                 user_ai_q.strip(),
                                 df_itin.drop(columns=["_day_num"], errors="ignore"),
                                 df_links,
+                                df_hotels,
                                 trip_info_str
                             )
                         st.markdown("### 💡 AI 顧問分析報告")
                         st.markdown(ai_reply)
 
-    # --- 共用分頁 1：🗺️ 全景點 ＆ 每日行程互動地圖總覽 ---
+    # --- 共用分頁 1：🏨 住宿飯店管理（支援單間或多間換飯店） ---
+    with tab_hotel:
+        st.subheader("🏨 住宿飯店管理（支援單間或多間換飯店行程）")
+        st.caption("在這裡登錄預訂的飯店與入住/退房詳細時間後，系統會自動同步到「每日行程表」、「互動地圖」與「路線距離試算」！")
+
+        with st.container(border=True):
+            st.markdown("**➕ 新增預訂飯店**")
+            default_ci_date = saved_start if saved_start else datetime.date.today() + timedelta(days=14)
+            default_co_date = saved_end if saved_end else default_ci_date + timedelta(days=4)
+
+            with st.form("add_hotel_form", clear_on_submit=True):
+                hc1, hc2 = st.columns([3, 3])
+                with hc1:
+                    h_name = st.text_input("🏨 飯店名稱 *", placeholder="例如：難波東方酒店 / 阪急龍仕柏飯店")
+                with hc2:
+                    h_url = st.text_input("🔗 Google Maps 網址或訂房連結（選填）", placeholder="https://maps.app.goo.gl/...")
+
+                hc3, hc4, hc5, hc6 = st.columns([2, 1.5, 2, 1.5])
+                with hc3:
+                    h_ci_date = st.date_input("📅 入住日期 *", value=default_ci_date)
+                with hc4:
+                    h_ci_time = st.time_input("🕒 入住時間 *", value=datetime.time(15, 0), step=900)
+                with hc5:
+                    h_co_date = st.date_input("📅 退房日期 *", value=default_co_date)
+                with hc6:
+                    h_co_time = st.time_input("🕚 退房時間 *", value=datetime.time(11, 0), step=900)
+
+                h_note = st.text_input("📝 訂房備註（選填）", placeholder="例如：Agoda 訂房代號 #123456、含雙人早餐、可免費寄放行李")
+
+                if st.form_submit_button("✅ 儲存這間飯店資訊", type="primary"):
+                    if not h_name.strip():
+                        st.warning("⚠️ 請輸入飯店名稱喔！")
+                    elif h_co_date < h_ci_date:
+                        st.error("❌ 退房日期不能早於入住日期喔！")
+                    else:
+                        with st.spinner("🔍 正在透過 Google API 解析飯店座標與最近地鐵/電鐵站..."):
+                            _, resolved_sub = resolve_place_and_subway(h_url.strip(), h_name.strip(), "", h_note.strip())
+
+                        new_h = pd.DataFrame([{
+                            "飯店名稱": h_name.strip(),
+                            "網址": h_url.strip(),
+                            "入住日期": h_ci_date.isoformat(),
+                            "入住時間": h_ci_time.strftime("%H:%M"),
+                            "退房日期": h_co_date.isoformat(),
+                            "退房時間": h_co_time.strftime("%H:%M"),
+                            "最近車站": resolved_sub,
+                            "訂房備註": h_note.strip(),
+                            "新增者": current_user
+                        }])
+                        df_hotels = pd.concat([df_hotels, new_h], ignore_index=True)
+                        save_sheet_df(ws_hotels, df_hotels, HOTEL_COLS)
+                        st.success(f"✅ 已成功新增飯店「{h_name.strip()}」！")
+                        st.rerun()
+
+        st.divider()
+
+        if df_hotels.empty:
+            st.info("目前尚未登錄任何預訂飯店，快從上方新增第一間住宿飯店吧！")
+        else:
+            st.markdown("### 🛏️ 已預訂住宿清單（依入住日期排序）")
+            df_hotels_sorted = df_hotels.sort_values(by=["入住日期"]).copy()
+
+            for h_idx, h_row in df_hotels_sorted.iterrows():
+                try:
+                    d_in = datetime.date.fromisoformat(str(h_row["入住日期"]).strip())
+                    d_out = datetime.date.fromisoformat(str(h_row["退房日期"]).strip())
+                    nights = max(1, (d_out - d_in).days)
+                    in_disp = f"{d_in.strftime('%Y/%m/%d')} ({WEEKDAY_ZH[d_in.weekday()]}) {h_row['入住時間']}"
+                    out_disp = f"{d_out.strftime('%Y/%m/%d')} ({WEEKDAY_ZH[d_out.weekday()]}) {h_row['退房時間']}"
+                    stay_badge = f"共 {nights} 晚"
+                except Exception:
+                    in_disp = f"{h_row['入住日期']} {h_row['入住時間']}"
+                    out_disp = f"{h_row['退房日期']} {h_row['退房時間']}"
+                    stay_badge = ""
+
+                with st.container(border=True):
+                    hc_left, hc_right = st.columns([5, 1.5])
+                    with hc_left:
+                        st.markdown(f"#### 🏨 {h_row['飯店名稱']} `{stay_badge}`")
+                        st.markdown(f"🔑 **入住**：`{in_disp}`  ➡️  🧳 **退房**：`{out_disp}`")
+                        if str(h_row["最近車站"]).strip():
+                            st.caption(f"🚉 {h_row['最近車站']}")
+                        if str(h_row["訂房備註"]).strip():
+                            st.write(f"📝 {h_row['訂房備註']}")
+
+                    with hc_right:
+                        gmap_h_url = str(h_row["網址"]).strip()
+                        if not gmap_h_url.startswith("http"):
+                            q_h = urllib.parse.quote(f"大阪 {h_row['飯店名稱']}")
+                            gmap_h_url = f"https://www.google.com/maps/search/?api=1&query={q_h}"
+                        st.link_button("📍 地圖導航", gmap_h_url, use_container_width=True)
+
+                        if st.button("🗑️ 刪除飯店", key=f"del_hotel_{h_idx}", use_container_width=True):
+                            df_hotels = df_hotels.drop(h_idx).reset_index(drop=True)
+                            save_sheet_df(ws_hotels, df_hotels, HOTEL_COLS)
+                            st.success("✅ 已刪除此間飯店！")
+                            st.rerun()
+
+                with st.expander(f"✏️ 修改「{h_row['飯店名稱']}」的日期、時間或備註"):
+                    with st.form(f"edit_hotel_form_{h_idx}"):
+                        eh1, eh2 = st.columns([3, 3])
+                        with eh1:
+                            e_h_name = st.text_input("飯店名稱", value=str(h_row["飯店名稱"]))
+                        with eh2:
+                            e_h_url = st.text_input("網址", value=str(h_row["網址"]))
+
+                        eh3, eh4, eh5, eh6 = st.columns([2, 1.5, 2, 1.5])
+                        try:
+                            cur_ci_d = datetime.date.fromisoformat(str(h_row["入住日期"]).strip())
+                            cur_co_d = datetime.date.fromisoformat(str(h_row["退房日期"]).strip())
+                        except Exception:
+                            cur_ci_d = datetime.date.today()
+                            cur_co_d = datetime.date.today() + timedelta(days=1)
+
+                        try:
+                            ci_h, ci_m = map(int, str(h_row["入住時間"]).split(":")[:2])
+                            cur_ci_t = datetime.time(ci_h, ci_m)
+                        except Exception:
+                            cur_ci_t = datetime.time(15, 0)
+
+                        try:
+                            co_h, co_m = map(int, str(h_row["退房時間"]).split(":")[:2])
+                            cur_co_t = datetime.time(co_h, co_m)
+                        except Exception:
+                            cur_co_t = datetime.time(11, 0)
+
+                        with eh3:
+                            e_ci_d = st.date_input("入住日期", value=cur_ci_d)
+                        with eh4:
+                            e_ci_t = st.time_input("入住時間", value=cur_ci_t, step=900)
+                        with eh5:
+                            e_co_d = st.date_input("退房日期", value=cur_co_d)
+                        with eh6:
+                            e_co_t = st.time_input("退房時間", value=cur_co_t, step=900)
+
+                        e_h_note = st.text_input("訂房備註", value=str(h_row["訂房備註"]))
+                        recheck_h_sub = st.checkbox("🔄 儲存時重新反查最近車站")
+
+                        if st.form_submit_button("💾 儲存飯店修改", type="primary"):
+                            if e_co_d < e_ci_d:
+                                st.error("❌ 退房日期不能早於入住日期喔！")
+                            else:
+                                final_h_sub = str(h_row["最近車站"]).strip()
+                                if recheck_h_sub or e_h_name.strip() != str(h_row["飯店名稱"]).strip():
+                                    _, final_h_sub = resolve_place_and_subway(e_h_url.strip(), e_h_name.strip(), "", e_h_note.strip())
+
+                                df_hotels.at[h_idx, "飯店名稱"] = e_h_name.strip()
+                                df_hotels.at[h_idx, "網址"] = e_h_url.strip()
+                                df_hotels.at[h_idx, "入住日期"] = e_ci_d.isoformat()
+                                df_hotels.at[h_idx, "入住時間"] = e_ci_t.strftime("%H:%M")
+                                df_hotels.at[h_idx, "退房日期"] = e_co_d.isoformat()
+                                df_hotels.at[h_idx, "退房時間"] = e_co_t.strftime("%H:%M")
+                                df_hotels.at[h_idx, "最近車站"] = final_h_sub
+                                df_hotels.at[h_idx, "訂房備註"] = e_h_note.strip()
+                                save_sheet_df(ws_hotels, df_hotels, HOTEL_COLS)
+                                st.success("✅ 飯店資訊已更新！")
+                                st.rerun()
+
+    # --- 共用分頁 2：🗺️ 全景點 ＆ 每日行程互動地圖總覽 ---
     with tab_map:
         st.subheader("🗺️ 全景點 ＆ 每日動線互動地圖總覽")
-        st.caption("🔴 美食 ｜ 🟣 購物 ｜ 🟢 景點與地標 ｜ 🔵 交通/住宿（滑鼠移到標記上或手機點擊可查看店名與車站資訊）")
+        st.caption("🟡 住宿飯店 ｜ 🔴 美食 ｜ 🟣 購物 ｜ 🟢 景點與地標 ｜ 🔵 交通/住宿（滑鼠移到標記上或手機點擊可查看店名與車站資訊）")
 
         ctrl_m1, ctrl_m2 = st.columns([3, 2])
         with ctrl_m1:
             map_mode = st.radio(
                 "選擇地圖顯示模式：",
                 [
-                    "🌍 全部收藏景點總覽（看清所有美食/購物聚落）",
+                    "🌍 全部收藏景點 ＆ 住宿飯店總覽",
                     "🗓️ 單日行程動線連線模式（用路線連起當天每一站）"
                 ],
                 horizontal=True
@@ -1490,22 +1747,43 @@ if st.session_state["workspace_area"] == "shared":
                 horizontal=True
             )
 
-        # 模式 A：全部收藏景點總覽
+        # 模式 A：全部收藏景點 ＆ 住宿飯店總覽
         if map_mode.startswith("🌍"):
-            if df_links.empty:
-                st.info("目前共用清單還沒有景點喔！快去「➕ 新增連結」加入幾個地點吧。")
+            if df_links.empty and df_hotels.empty:
+                st.info("目前共用清單與住宿飯店還沒有資料喔！")
             else:
-                mf1, mf2 = st.columns(2)
+                mf1, mf2, mf3 = st.columns([2, 2, 1.5])
                 with mf1:
                     map_cats = st.multiselect("篩選顯示分類：", CAT_OPTIONS, default=CAT_OPTIONS, key="map_cat_filter")
                 with mf2:
                     map_regs = st.multiselect("篩選顯示區域：", REGION_OPTIONS, default=REGION_OPTIONS, key="map_reg_filter")
+                with mf3:
+                    st.write("")
+                    show_hotels_on_map = st.checkbox("🏨 同時標示預訂飯店", value=True)
 
                 sub_map_df = df_links[df_links["分類"].isin(map_cats) & df_links["區域"].isin(map_regs)].copy()
 
                 map_points = []
                 unmapped_names = []
                 with st.spinner("🗺️ 正在定位地圖座標..."):
+                    if show_hotels_on_map and not df_hotels.empty:
+                        for _, hr in df_hotels.iterrows():
+                            h_n = str(hr["飯店名稱"]).strip()
+                            h_u = str(hr["網址"]).strip()
+                            h_sub = str(hr["最近車站"]).strip()
+                            _, _, h_lat, h_lon, _, _ = resolve_place_full(url=h_u, custom_name=h_n)
+                            if h_lat is not None and h_lon is not None:
+                                map_points.append({
+                                    "name": f"🏨 {h_n}",
+                                    "category": "住宿飯店",
+                                    "region": f"{hr['入住日期']} ~ {hr['退房日期']}",
+                                    "station": h_sub,
+                                    "note": str(hr["訂房備註"]).strip() or "已預訂住宿飯店",
+                                    "lat": h_lat,
+                                    "lon": h_lon,
+                                    "color": CAT_COLOR_RGBA["住宿飯店"]
+                                })
+
                     for _, r in sub_map_df.iterrows():
                         s_name = str(r["自訂名稱"]).strip() or str(r["自動抓取標題"]).strip()
                         s_url = str(r["網址"]).strip()
@@ -1529,7 +1807,7 @@ if st.session_state["workspace_area"] == "shared":
                             unmapped_names.append(s_name)
 
                 if not map_points:
-                    st.warning("⚠️ 目前篩選的景點尚未取得精準座標（可能是未指定分店的連鎖店）。")
+                    st.warning("⚠️ 目前篩選的地點尚未取得精準座標（可能是未指定分店的連鎖店）。")
                 else:
                     df_pts = pd.DataFrame(map_points)
                     center_lat = float(df_pts["lat"].mean())
@@ -1545,7 +1823,7 @@ if st.session_state["workspace_area"] == "shared":
                     )
 
                     tooltip = {
-                        "html": "<b>{name}</b><br/>🏷️ {category} ｜ 🗺️ {region}<br/>🚉 {station}<br/>📝 {note}",
+                        "html": "<b>{name}</b><br/>🏷️ {category} ｜ 📅 {region}<br/>🚉 {station}<br/>📝 {note}",
                         "style": {"backgroundColor": "#1e272e", "color": "white", "fontSize": "13px", "borderRadius": "8px", "padding": "8px"}
                     }
 
@@ -1555,7 +1833,7 @@ if st.session_state["workspace_area"] == "shared":
                         tooltip=tooltip,
                         map_style="https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
                     ))
-                    st.success(f"📍 地圖上已成功標示 **{len(df_pts)}** 個地點！")
+                    st.success(f"📍 地圖上已成功標示 **{len(df_pts)}** 個地點（含已預訂飯店）！")
                     if unmapped_names:
                         st.caption(f"ℹ️ 以下地點因未指定分店或尚無座標，未顯示於地圖上：{', '.join(unmapped_names)}")
 
@@ -1582,13 +1860,13 @@ if st.session_state["workspace_area"] == "shared":
                 day_pts = []
                 with st.spinner(f"🧭 正在繪製 {chosen_map_day} 動線地圖..."):
                     for seq_idx, (_, r) in enumerate(day_sub.iterrows(), start=1):
-                        s_name = str(r["行程名稱"]).strip()
+                        s_name = str(r["行程名稱"]).replace("🏨 飯店退房：", "").replace("🔑 飯店入住：", "").strip()
                         u_str, reg_str, note_str = link_meta_map.get(s_name, (str(r["網址"]).strip(), "", ""))
                         _, s_sub, lat_v, lon_v, _, _ = resolve_place_full(url=u_str, custom_name=s_name, region=reg_str, note=note_str)
                         if lat_v is not None and lon_v is not None:
                             day_pts.append({
                                 "seq_label": f"第 {seq_idx} 站（{r['時間']}）",
-                                "name": s_name,
+                                "name": str(r["行程名稱"]).strip(),
                                 "category": str(r["分類"]).strip(),
                                 "station": s_sub,
                                 "note": str(r["備註"]).strip() or "無備註",
@@ -1654,7 +1932,7 @@ if st.session_state["workspace_area"] == "shared":
                         st.dataframe(pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
                         st.caption(f"🏁 {chosen_map_day} 全日累計直線移動距離：約 **{total_km:.2f} km**")
 
-    # --- 共用分頁 2：瀏覽共用清單 ---
+    # --- 共用分頁 3：瀏覽共用清單 ---
     with tab1:
         if df_links.empty:
             st.info("目前清單空空如也，快切換到「➕ 新增連結」加入第一個大阪景點吧！")
@@ -1738,13 +2016,13 @@ if st.session_state["workspace_area"] == "shared":
                 }
             )
 
-    # --- 共用分頁 3：路線與距離試算 ---
+    # --- 共用分頁 4：路線與距離試算 ---
     with tab2:
         st.subheader("🧭 路線距離與電車轉乘試算")
         calc_mode = st.radio(
             "請選擇試算模式：",
             [
-                "🏨 基準定點（飯店/機場）↔ 📋 清單景點（批量雙向比對）",
+                "🏨 基準定點（已訂飯店/機場）↔ 📋 清單景點（批量雙向比對）",
                 "📍 任意兩定點直接對比（例如：比對機場與候選飯店距離）"
             ],
             horizontal=True
@@ -1752,7 +2030,21 @@ if st.session_state["workspace_area"] == "shared":
 
         if calc_mode.startswith("🏨"):
             with st.container(border=True):
-                st.markdown("**步驟 1️⃣：設定基準定點（例如：飯店、關西機場、難波車站）**")
+                st.markdown("**步驟 1️⃣：設定基準定點（可直接點選已預訂的飯店，或輸入機場/車站）**")
+
+                if not df_hotels.empty:
+                    h_btn_cols = st.columns(min(4, len(df_hotels)))
+                    for idx_h, (_, hr) in enumerate(df_hotels.iterrows()):
+                        with h_btn_cols[idx_h % 4]:
+                            h_label_name = str(hr["飯店名稱"]).strip()
+                            if st.button(f"🏨 帶入：{h_label_name}", key=f"quick_base_h_{idx_h}", use_container_width=True):
+                                raw_val = f"{h_label_name} {str(hr['網址']).strip()}".strip()
+                                parsed = resolve_free_text_or_url(raw_val)
+                                if parsed["lat"] is not None:
+                                    st.session_state["base_raw_input"] = raw_val
+                                    st.session_state["base_info"] = parsed
+                                    st.rerun()
+
                 base_col1, base_col2 = st.columns([3, 1])
                 with base_col1:
                     base_input = st.text_input(
@@ -1949,7 +2241,7 @@ if st.session_state["workspace_area"] == "shared":
                             }
                         )
 
-    # --- 共用分頁 4：新增連結 ---
+    # --- 共用分頁 5：新增連結 ---
     with tab3:
         with st.form("add_link_form", clear_on_submit=True):
             st.subheader("新增景點 / 餐廳 / 購物連結")
@@ -2015,7 +2307,7 @@ if st.session_state["workspace_area"] == "shared":
                             st.success(f"✅ 新增成功！「{fetched_title}」｜{subway_result}")
                             st.rerun()
 
-    # --- 共用分頁 5：修改 / 刪除 ---
+    # --- 共用分頁 6：修改 / 刪除 ---
     with tab4:
         if df_links.empty:
             st.info("目前清單沒有任何資料可以修改或刪除。")
@@ -2081,7 +2373,7 @@ if st.session_state["workspace_area"] == "shared":
                 st.success("✅ 已成功刪除該筆連結！")
                 st.rerun()
 
-    # --- 共用分頁 6：💰 共同支出記帳＆自動分帳計算機 ---
+    # --- 共用分頁 7：💰 共同支出記帳＆自動分帳計算機 ---
     with tab5:
         st.subheader("💰 共同支出記帳區 ＆ 自動分帳計算機")
         live_rate, rate_status, _ = fetch_live_jpy_to_twd()
@@ -2241,14 +2533,14 @@ if st.session_state["workspace_area"] == "shared":
                             for debtor, creditor, amt in twd_transfers:
                                 st.warning(f"💸 **{debtor}** ➔ 轉給 **{creditor}**：**NT$ {amt:,} TWD**")
 
-    # --- 共用分頁 7：匯出精美 Excel ---
+    # --- 共用分頁 8：匯出精美 Excel ---
     with tab6:
-        st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、依區域上色分類，並產生包含「每日行程表」、「總表」與各分類分頁的 Excel 檔案。")
-        if df_links.empty and df_itin.empty:
+        st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、依區域上色分類，並產生包含「住宿飯店表」、「每日行程表」、「總表」與各分類分頁的 Excel 檔案。")
+        if df_links.empty and df_itin.empty and df_hotels.empty:
             st.info("目前沒有資料可以匯出喔！")
         else:
             if st.button("🚀 開始統整並產生 Excel", type="primary"):
-                excel_data = generate_styled_excel(df_links.copy(), df_itin.copy())
+                excel_data = generate_styled_excel(df_links.copy(), df_itin.copy(), df_hotels.copy())
                 ts = datetime.datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S")
                 st.session_state["excel_bytes"] = excel_data
                 st.session_state["excel_filename"] = f"大阪旅遊統整表_{ts}.xlsx"
