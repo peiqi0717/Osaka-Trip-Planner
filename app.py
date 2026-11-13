@@ -99,7 +99,7 @@ def save_data(df):
     ws.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
 
 # ==========================================
-# 3. 精準座標解析與全鐵道(地鐵+電鐵+JR)查詢引擎
+# 3. Google 官方三重引擎座標解析與全鐵道查詢
 # ==========================================
 def is_google_maps_url(url):
     return any(domain in url.lower() for domain in [
@@ -107,22 +107,21 @@ def is_google_maps_url(url):
     ])
 
 def is_valid_kansai_coords(lat, lon):
-    """確認座標位於關西圈合理範圍內，並排除大阪府廳預設中心點誤判"""
+    """確認座標位於關西圈合理範圍內，並排除大阪府廳預設中心點"""
     if not ((33.0 <= lat <= 36.2) and (134.0 <= lon <= 137.0)):
         return False
-    # 排除大阪府廳預設中心點 (34.6863, 135.5197) 避免假天滿橋站
     if abs(lat - 34.6863) < 0.0012 and abs(lon - 135.5197) < 0.0012:
         return False
     return True
 
 def extract_coords_from_text(text):
-    """從已解碼的網址或網頁內容提取精準經緯度（優先抓地標座標 !3d!4d）"""
     patterns = [
         r'!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
         r'@(-?\d+\.\d+),(-?\d+\.\d+)',
         r'[?&](?:q|ll|center)=(-?\d+\.\d+),(-?\d+\.\d+)',
         r'\[null,null,(-?\d+\.\d+),(-?\d+\.\d+)\]',
-        r'"latitude"\s*:\s*"?(-?\d+\.\d+)"?\s*,\s*"longitude"\s*:\s*"?(-?\d+\.\d+)"?'
+        r'"latitude"\s*:\s*"?(-?\d+\.\d+)"?\s*,\s*"longitude"\s*:\s*"?(-?\d+\.\d+)"?',
+        r'center=(-?\d+\.\d+)%2C(-?\d+\.\d+)'
     ]
     for pat in patterns:
         for m in re.finditer(pat, text):
@@ -132,7 +131,7 @@ def extract_coords_from_text(text):
     return None, None
 
 def resolve_google_maps_url(url):
-    """穿透 Google Consent 擋牆並追蹤完整轉跳紀錄，解析 Google 地圖連結的店家名稱與經緯度"""
+    """嘗試從 Google 地圖連結解析店家名稱與經緯度"""
     title = ""
     lat, lon = None, None
     try:
@@ -180,7 +179,6 @@ def resolve_google_maps_url(url):
     return title, lat, lon
 
 def scrape_webpage_title_and_coords(url):
-    """從一般網頁（食記、IG、官網）抓取標題與內嵌地圖座標"""
     title = ""
     lat, lon = None, None
     try:
@@ -216,123 +214,136 @@ def is_ambiguous_chain(name, region="", note=""):
         return False
     return any(chain.lower() in name.lower() for chain in COMMON_CHAINS)
 
-def extract_jp_address_from_web(query_str):
-    """透過 DuckDuckGo HTML 搜尋擷取日本真實地址（大阪府/京都府/兵庫縣/奈良縣 + 丁目/番地）"""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        }
-        res = requests.post(
-            "https://html.duckduckgo.com/html/",
-            data={"q": f"{query_str} 住所 大阪"},
-            headers=headers,
-            timeout=5
-        )
-        # 匹配日本完整門牌地址（例如：大阪府大阪市中央区心斎橋筋1-4-29）
-        addr_match = re.search(
-            r'((?:大阪府|京都府|兵庫県|奈良県)[^\s<>"\'、。]{4,25}[0-9０-９一二三四五六七八九十\-－丁目番地号]+)',
-            res.text
-        )
-        if addr_match:
-            return addr_match.group(1)
-    except Exception:
-        pass
-    return None
-
-def search_coordinates_by_clues(place_name, region="", note=""):
+def query_google_official_apis(place_name, region="", note=""):
     """
-    精準座標反查（嚴格過濾行政區中心點，絕不亂給假座標）：
-    1. 若有設定 Google Places API 金鑰則優先使用
-    2. 透過日本國土地理院 (GSI) 查詢具體地標或反查到的日本門牌地址
-    3. 透過 OpenStreetMap Nominatim 查詢（嚴格排除 city/administrative 行政區中心點）
+    呼叫 Google 官方三重介面取得精準座標與官方店名：
+    1. Places API (New) Text Search
+    2. Legacy Places API Text Search
+    3. Geocoding API
+    回傳: (lat, lon, official_name, error_msg)
     """
-    if not place_name or place_name in ["未知地點 (需手動確認)", "YouTube 推薦影片"]:
-        return None, None
-
-    # 引擎 0（選配）：Google Places API
     api_key = st.secrets.get("google_maps_api_key", "").strip()
-    if api_key:
-        try:
-            reg_hint = region.split("/")[0] if (region and region != "其他/未指定") else "大阪"
-            text_q = f"{reg_hint} {place_name} {note}".strip()
-            res = requests.post(
-                "https://places.googleapis.com/v1/places:searchText",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Goog-Api-Key": api_key,
-                    "X-Goog-FieldMask": "places.location"
-                },
-                json={"textQuery": text_q, "languageCode": "zh-TW"},
-                timeout=5
-            )
-            places = res.json().get("places", [])
-            if places and "location" in places[0]:
-                lat = float(places[0]["location"]["latitude"])
-                lon = float(places[0]["location"]["longitude"])
-                if is_valid_kansai_coords(lat, lon):
-                    return lat, lon
-        except Exception:
-            pass
+    if not api_key:
+        return None, None, "", "未設定 google_maps_api_key"
 
     reg_first = region.split("/")[0] if (region and region != "其他/未指定") else ""
-    clean_name = re.sub(r'[（(].*?[）)]', '', place_name).strip()
+    area_prefix = reg_first if reg_first else "大阪"
 
-    # 組合搜尋詞（避免過度拆詞導致抓到整個區公所）
-    queries = []
-    if reg_first:
-        queries.append(f"{clean_name} {reg_first}")
-    queries.append(clean_name)
+    # 組合精準搜尋字串（包含店名、商圈與備註建築線索）
+    clean_note = ""
+    if note and not any(k in note for k in ["很多分店", "多家分店", "燒肉店", "咖哩飯"]):
+        clean_note = note.strip()[:25]
 
-    # 嘗試從網路搜尋擷取該店真實日本門牌地址，再用國土地理院轉成精準座標
-    jp_addr = extract_jp_address_from_web(f"{clean_name} {reg_first}".strip())
-    if jp_addr:
-        queries.insert(0, jp_addr)
+    text_query = f"{place_name} {area_prefix} {clean_note}".strip()
+    if not any(k in text_query for k in ["大阪", "京都", "神戶", "奈良", "Osaka", "Kyoto"]):
+        text_query = f"大阪 {text_query}"
 
-    # 引擎 1：日本國土地理院 (GSI) 官方地址/設施 API
-    for q in queries:
-        try:
-            res = requests.get(
-                "https://msearch.gsi.go.jp/address-search/AddressSearch",
-                params={"q": q},
-                timeout=4
-            )
-            results = res.json()
-            if isinstance(results, list) and results:
-                for item in results:
-                    title_prop = item.get("properties", {}).get("title", "")
-                    # 排除只匹配到整個「大阪市」或「大阪府」的寬泛結果
-                    if title_prop in ["大阪府", "大阪府大阪市", "京都府", "兵庫県", "奈良県"]:
-                        continue
-                    coords = item.get("geometry", {}).get("coordinates", [])
-                    if len(coords) == 2:
-                        lon, lat = float(coords[0]), float(coords[1])
-                        if is_valid_kansai_coords(lat, lon):
-                            return lat, lon
-        except Exception:
-            continue
+    last_error = ""
 
-    # 引擎 2：OpenStreetMap Nominatim（嚴格過濾行政區中心點）
-    for q in queries:
-        try:
-            search_q = q if any(k in q for k in ["大阪", "京都", "神戶", "奈良"]) else f"{q} 大阪"
-            res = requests.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={"q": search_q, "format": "json", "limit": 3, "countrycodes": "jp"},
-                headers={"User-Agent": "OsakaTripPlannerApp/4.0"},
-                timeout=4
-            )
-            data = res.json()
-            if data:
-                for item in data:
-                    # 關鍵防呆：如果回傳類別是行政區邊界(boundary/administrative)，代表沒找到店面，直接跳過！
-                    if item.get("class") == "boundary" or item.get("type") in ["administrative", "city", "prefecture"]:
-                        continue
-                    lat, lon = float(item["lat"]), float(item["lon"])
-                    if is_valid_kansai_coords(lat, lon):
-                        return lat, lon
-        except Exception:
-            continue
+    # --- 通道 1：Places API (New) ---
+    try:
+        res = requests.post(
+            "https://places.googleapis.com/v1/places:searchText",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": api_key,
+                "X-Goog-FieldMask": "places.displayName,places.location,places.formattedAddress"
+            },
+            json={
+                "textQuery": text_query,
+                "languageCode": "zh-TW",
+                "regionCode": "JP"
+            },
+            timeout=6
+        )
+        data = res.json()
+        if "error" in data:
+            last_error = f"Places(New): {data['error'].get('message', '')}"
+        elif data.get("places"):
+            for p in data["places"]:
+                loc = p.get("location", {})
+                lat = float(loc.get("latitude", 0))
+                lon = float(loc.get("longitude", 0))
+                if is_valid_kansai_coords(lat, lon):
+                    disp_name = p.get("displayName", {}).get("text", "")
+                    return lat, lon, disp_name, ""
+    except Exception as e:
+        last_error = str(e)
 
+    # --- 通道 2：Legacy Places API Text Search ---
+    try:
+        res = requests.get(
+            "https://maps.googleapis.com/maps/api/place/textsearch/json",
+            params={
+                "query": text_query,
+                "language": "zh-TW",
+                "region": "jp",
+                "key": api_key
+            },
+            timeout=6
+        )
+        data = res.json()
+        status = data.get("status", "")
+        if status == "OK" and data.get("results"):
+            for item in data["results"]:
+                loc = item.get("geometry", {}).get("location", {})
+                lat = float(loc.get("lat", 0))
+                lon = float(loc.get("lng", 0))
+                if is_valid_kansai_coords(lat, lon):
+                    return lat, lon, item.get("name", ""), ""
+        elif status not in ["OK", "ZERO_RESULTS"]:
+            last_error = f"Places(Legacy): {status} - {data.get('error_message', '')}"
+    except Exception as e:
+        last_error = str(e)
+
+    # --- 通道 3：Google Geocoding API ---
+    try:
+        res = requests.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={
+                "address": text_query,
+                "language": "zh-TW",
+                "region": "jp",
+                "key": api_key
+            },
+            timeout=6
+        )
+        data = res.json()
+        if data.get("status") == "OK" and data.get("results"):
+            for item in data["results"]:
+                # 排除過於寬泛的整個城市行政中心
+                types = item.get("types", [])
+                if "locality" in types or "administrative_area_level_1" in types:
+                    continue
+                loc = item.get("geometry", {}).get("location", {})
+                lat = float(loc.get("lat", 0))
+                lon = float(loc.get("lng", 0))
+                if is_valid_kansai_coords(lat, lon):
+                    return lat, lon, "", ""
+    except Exception as e:
+        last_error = str(e)
+
+    return None, None, "", last_error
+
+def search_free_fallback_coords(place_name, region=""):
+    """當未設定 Google API 金鑰時的免費備援查詢"""
+    reg_first = region.split("/")[0] if (region and region != "其他/未指定") else ""
+    q = f"{place_name} {reg_first} 大阪".strip()
+    try:
+        res = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": q, "format": "json", "limit": 3, "countrycodes": "jp"},
+            headers={"User-Agent": "OsakaTripPlannerApp/6.0"},
+            timeout=4
+        )
+        for item in res.json():
+            if item.get("class") == "boundary" or item.get("type") in ["administrative", "city", "prefecture"]:
+                continue
+            lat, lon = float(item["lat"]), float(item["lon"])
+            if is_valid_kansai_coords(lat, lon):
+                return lat, lon
+    except Exception:
+        pass
     return None, None
 
 def format_walking_time(dist_str):
@@ -349,20 +360,17 @@ def format_walking_time(dist_str):
         return f"約 {dist_str}"
 
 def clean_line_name(raw_line):
-    """美化日本鐵道路線名稱"""
-    return (
-        raw_line
-        .replace("大阪市高速電気軌道", "Osaka Metro ")
-        .replace("大阪メトロ", "Osaka Metro ")
-        .replace("大阪", "Osaka Metro ")
-        .strip()
-    )
+    line = raw_line.strip()
+    if line.startswith("大阪市高速電気軌道"):
+        return line.replace("大阪市高速電気軌道", "Osaka Metro ", 1)
+    if line.startswith("大阪メトロ"):
+        return line.replace("大阪メトロ", "Osaka Metro ", 1)
+    if line.startswith("大阪") and not line.startswith("大阪モノレール"):
+        return "Osaka Metro " + line[2:]
+    return line
 
 def query_nearest_stations_all(lat, lon):
-    """
-    查詢距離最近的車站（包含 Osaka Metro 地鐵、JR、阪急、阪神、南海、近鐵、京阪全部電鐵），
-    並自動合併同站多條交會路線，避免捨近求遠。
-    """
+    """查詢距離最近的車站（包含 Osaka Metro 地鐵、JR、阪急、阪神、南海、近鐵、京阪全部電鐵）"""
     try:
         res = requests.get(
             "https://express.heartrails.com/api/json",
@@ -373,12 +381,10 @@ def query_nearest_stations_all(lat, lon):
         if not stations:
             return "查無鄰近車站"
 
-        # 直接取距離最近的第一個車站（不論地鐵或電鐵，絕不捨近求遠走50分鐘）
         nearest = stations[0]
         nearest_name = nearest.get("name", "")
         walk_text = format_walking_time(nearest.get("distance", ""))
 
-        # 收集距離該點 350 公尺內的所有車站與路線（涵蓋梅田/難波等共構與鄰近轉乘站）
         nearby_lines = []
         for s in stations:
             s_name = s.get("name", "")
@@ -389,14 +395,13 @@ def query_nearest_stations_all(lat, lon):
                 v = float(num_m.group(1))
                 meters = v * 1000 if "km" in dist_str.lower() else v
 
-            # 同站名一律收錄所有路線；若在 250m 內的其他同名/共構站也一併列出
             if s_name == nearest_name or meters <= 250:
                 line_label = clean_line_name(s.get("line", ""))
                 entry = line_label if s_name == nearest_name else f"{s_name}站-{line_label}"
                 if entry not in nearby_lines:
                     nearby_lines.append(entry)
 
-        lines_str = " / ".join(nearby_lines[:4])  # 最多顯示 4 條主要路線避免過長
+        lines_str = " / ".join(nearby_lines[:4])
         icon = "🚇" if "Osaka Metro" in lines_str else "🚃"
         return f"{icon} {nearest_name}站（{lines_str}，{walk_text}）"
     except Exception:
@@ -406,27 +411,41 @@ def resolve_place_and_subway(url, custom_name="", region="", note=""):
     final_title = custom_name.strip()
     lat, lon = None, None
 
+    # 1. 嘗試解析網址本身是否自帶標題與座標
     if is_google_maps_url(url):
         gmap_title, g_lat, g_lon = resolve_google_maps_url(url)
-        if not final_title:
-            final_title = gmap_title if gmap_title else "未知地點 (需手動確認)"
+        if not final_title and gmap_title:
+            final_title = gmap_title
         lat, lon = g_lat, g_lon
     else:
         web_title, w_lat, w_lon = scrape_webpage_title_and_coords(url)
-        if not final_title:
-            final_title = web_title if web_title else ("YouTube 推薦影片" if ('youtube.com' in url or 'youtu.be' in url) else "未知地點 (需手動確認)")
+        if not final_title and web_title:
+            final_title = web_title
         lat, lon = w_lat, w_lon
 
+    if not final_title:
+        final_title = "YouTube 推薦影片" if ('youtube.com' in url or 'youtu.be' in url) else "未知地點 (需手動確認)"
+
+    # 2. 若為未指定分店的多家分店連鎖店，直接略過
     if lat is None and is_ambiguous_chain(final_title, region, note):
         return final_title, "⏭️ 疑有多家分店（未指定分店或區域，不自動匹配車站）"
 
-    if lat is None or lon is None:
-        lat, lon = search_coordinates_by_clues(final_title, region, note)
+    # 3. 即使網址是 Google 地圖短網址但被擋沒抓到座標，也直接交給 Google 官方 API 反查
+    api_err = ""
+    if (lat is None or lon is None) and final_title not in ["未知地點 (需手動確認)", "YouTube 推薦影片"]:
+        g_lat, g_lon, official_name, api_err = query_google_official_apis(final_title, region, note)
+        if g_lat is not None and g_lon is not None:
+            lat, lon = g_lat, g_lon
+        else:
+            lat, lon = search_free_fallback_coords(final_title, region)
 
     if lat is not None and lon is not None:
         subway_info = query_nearest_stations_all(lat, lon)
     else:
-        subway_info = "⚠️ 未取得精準座標（建議貼 Google 地圖分享連結，或於修改頁手動輸入車站）"
+        if api_err:
+            subway_info = f"⚠️ Google API 提示：{api_err[:60]}"
+        else:
+            subway_info = "⚠️ 查無此店座標（請確認店名或貼完整電腦版地圖網址）"
 
     return final_title, subway_info
 
@@ -438,7 +457,7 @@ def generate_styled_excel(df_links):
     food_list, shop_list, spot_list, other_list = [], [], [], []
     sheet_updated = False
 
-    progress_bar = st.progress(0, text="🔍 正在解析座標、最近車站(地鐵/電鐵)與步行時間...")
+    progress_bar = st.progress(0, text="🔍 正在透過 Google API 解析座標與最近車站...")
     total_rows = len(df_links)
 
     for index, row in df_links.iterrows():
@@ -635,7 +654,9 @@ except Exception as e:
     st.error(f"❌ 無法連接 Google 試算表，請檢查 Secrets 設定與試算表共用權限。\n錯誤訊息：{e}")
     st.stop()
 
-st.caption(f"📊 目前共收錄 **{len(df_links)}** 筆景點與美食 ｜ [📄 直接開啟 Google 雲端試算表]({st.secrets['sheet_url']})")
+has_gmap_key = bool(st.secrets.get("google_maps_api_key", "").strip())
+key_badge = "✅ Google 地圖 API 已連線" if has_gmap_key else "⚠️ 尚未偵測到 Google 地圖 API 金鑰"
+st.caption(f"📊 目前共收錄 **{len(df_links)}** 筆景點與美食 ｜ {key_badge} ｜ [📄 直接開啟 Google 雲端試算表]({st.secrets['sheet_url']})")
 
 tab1, tab2, tab3, tab4 = st.tabs([
     "📋 瀏覽共用清單",
@@ -653,13 +674,13 @@ with tab1:
         with btn_col1:
             def needs_subway_lookup(val):
                 s = str(val).strip()
-                return (not s) or s.startswith(("查無", "未取得", "地鐵查詢逾時", "車站查詢逾時", "非地圖連結", "⏭️", "⚠️")) or ("天滿橋" in s)
+                return (not s) or s.startswith(("查無", "未取得", "地鐵查詢逾時", "車站查詢逾時", "非地圖連結", "⏭️", "⚠️")) or ("JROsaka" in s)
 
             retry_mask = df_links["最近地鐵站"].apply(needs_subway_lookup)
             retry_count = int(retry_mask.sum())
             if retry_count > 0:
                 if st.button(f"🚇 修正/補查 {retry_count} 筆資料的最近車站", type="primary", use_container_width=True):
-                    prog = st.progress(0, text="🚇 正在重新精準反查最近車站（地鐵/電鐵/JR）...")
+                    prog = st.progress(0, text="🚇 正在透過 Google API 精準反查最近車站...")
                     retry_indices = df_links[retry_mask].index.tolist()
                     for i, idx in enumerate(retry_indices):
                         row = df_links.loc[idx]
@@ -733,7 +754,7 @@ with tab2:
     with st.form("add_link_form", clear_on_submit=True):
         st.subheader("新增景點 / 餐廳 / 購物連結")
         raw_input = st.text_input("🔗 貼上網址（支援 Google Maps、IG、食記或一般網頁）*", placeholder="https://...")
-        c_name = st.text_input("✏️ 自訂中文/日文名稱（選填；系統會自動搜尋地址並計算最近地鐵與電鐵）", placeholder="例如：一蘭拉麵 道頓堀店")
+        c_name = st.text_input("✏️ 自訂中文/日文名稱（選填；系統會透過 Google API 自動搜尋地址與最近車站）", placeholder="例如：一蘭拉麵 道頓堀店")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -770,7 +791,7 @@ with tab2:
                         dup_name = dup_row["自訂名稱"] if str(dup_row["自訂名稱"]).strip() else "(無自訂名稱)"
                         st.warning(f"⚠️ 此網址已存在清單中！（名稱：{dup_name} ｜ 推薦人：{dup_row['新增者']} 於 {dup_row['新增時間']} 新增）")
                     else:
-                        with st.spinner("🔍 正在解析地點座標並計算最近車站(地鐵/電鐵)與步行時間..."):
+                        with st.spinner("🔍 正在透過 Google API 解析地點座標並計算最近車站(地鐵/電鐵)與步行時間..."):
                             fetched_title, subway_result = resolve_place_and_subway(
                                 extracted_url,
                                 c_name.strip(),
