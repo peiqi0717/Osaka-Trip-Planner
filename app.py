@@ -30,11 +30,14 @@ USER_COLS = ["暱稱", "密碼雜湊", "建立時間"]
 EXPENSE_COLS = ["日期時間", "項目名稱", "幣別", "金額", "付款人", "分攤成員", "備註", "記錄者"]
 SHOPPING_COLS = ["擁有者", "商品名稱", "分類", "購買地點", "日幣金額", "幫誰買", "已買到", "備註"]
 PACKING_COLS = ["擁有者", "分類", "物品名稱", "數量", "已打包"]
+ITINERARY_COLS = ["天數", "日期", "時間", "行程名稱", "分類", "最近車站", "網址", "備註", "排程者"]
+META_COLS = ["設定鍵", "設定值"]
 
-CAT_OPTIONS = ["美食", "購物", "景點與地標", "未分類"]
+CAT_OPTIONS = ["美食", "購物", "景點與地標", "交通/住宿", "未分類"]
 REGION_OPTIONS = ["難波/心齋橋", "梅田", "天王寺/阿倍野", "環球影城/港區", "京都/神戶/奈良", "其他/未指定"]
 SHOP_CAT_OPTIONS = ["藥妝美妝", "伴手禮/零食", "服飾/精品", "動漫/雜貨", "親友代購", "其他"]
 PACK_CAT_OPTIONS = ["重要證件/錢包", "3C電子/網路", "衣物穿搭", "盥洗/常備藥品", "隨身小物", "其他"]
+WEEKDAY_ZH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
 
 DEFAULT_PACKING_TEMPLATE = [
     ("重要證件/錢包", "護照（確認效期 6 個月以上）", "1"),
@@ -74,14 +77,9 @@ BRANCH_INDICATORS = [
 # ==========================================
 @st.cache_data(ttl=1800)
 def fetch_live_jpy_to_twd():
-    """
-    從免費即時匯率 API 抓取最新 1 JPY = ? TWD 匯率（含雙重備援）。
-    回傳: (rate_float, status_text, is_live_bool)
-    """
     tw_tz = timezone(timedelta(hours=8))
     now_str = datetime.datetime.now(tw_tz).strftime("%H:%M")
 
-    # 來源 1：ExchangeRate-API 開放端點（免金鑰、即時更新）
     try:
         res = requests.get("https://open.er-api.com/v6/latest/JPY", timeout=4)
         data = res.json()
@@ -92,7 +90,6 @@ def fetch_live_jpy_to_twd():
     except Exception:
         pass
 
-    # 來源 2：FawazAhmed 免費貨幣 CDN 備援
     try:
         res = requests.get(
             "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/jpy.json",
@@ -105,7 +102,6 @@ def fetch_live_jpy_to_twd():
     except Exception:
         pass
 
-    # 若網路暫時無法取得，回傳預設參考值
     return 0.2150, "⚠️ 離線預設參考匯率（可手動調整）", False
 
 # ==========================================
@@ -168,8 +164,32 @@ def save_data(df):
     ws = get_main_worksheet()
     save_sheet_df(ws, df, DEFAULT_COLS)
 
+def load_trip_dates():
+    """從試算表『旅遊設定』工作表讀取全團共用的出發與回程日期"""
+    ws_meta = get_or_create_ws("旅遊設定", META_COLS)
+    df_meta = load_sheet_df(ws_meta, META_COLS)
+    meta_dict = dict(zip(df_meta["設定鍵"], df_meta["設定值"]))
+    start_str = meta_dict.get("start_date", "")
+    end_str = meta_dict.get("end_date", "")
+    try:
+        s_date = datetime.date.fromisoformat(start_str)
+        e_date = datetime.date.fromisoformat(end_str)
+        if e_date >= s_date:
+            return s_date, e_date
+    except Exception:
+        pass
+    return None, None
+
+def save_trip_dates(start_date, end_date):
+    ws_meta = get_or_create_ws("旅遊設定", META_COLS)
+    df_meta = pd.DataFrame([
+        {"設定鍵": "start_date", "設定值": start_date.isoformat()},
+        {"設定鍵": "end_date", "設定值": end_date.isoformat()}
+    ])
+    save_sheet_df(ws_meta, df_meta, META_COLS)
+
 # ==========================================
-# 4. 帳號驗證與分帳演算法工具
+# 4. 帳號驗證、分帳與 AI 助手工具
 # ==========================================
 def hash_pin(nickname, pin_str):
     raw = f"osaka_trip_{nickname.strip()}_{pin_str.strip()}"
@@ -222,7 +242,6 @@ def _solve_debt_graph(paid_map, owed_map):
     return pd.DataFrame(summary_rows), transfers
 
 def calculate_settlements(df_exp, currency):
-    """針對單一幣別計算結算與最少轉帳建議"""
     sub = df_exp[df_exp["幣別"] == currency].copy()
     if sub.empty:
         return pd.DataFrame(), []
@@ -251,7 +270,6 @@ def calculate_settlements(df_exp, currency):
     return _solve_debt_graph(paid_map, owed_map)
 
 def calculate_combined_twd_settlements(df_exp, jpy_to_twd_rate):
-    """將日幣支出即時換算成台幣，與台幣支出合併計算最終台幣結清方式"""
     if df_exp.empty:
         return pd.DataFrame(), []
 
@@ -280,6 +298,59 @@ def calculate_combined_twd_settlements(df_exp, jpy_to_twd_rate):
             owed_map[p] = owed_map.get(p, 0.0) + share
 
     return _solve_debt_graph(paid_map, owed_map)
+
+def ask_travel_ai_assistant(user_prompt, df_itin, df_links, trip_days_info):
+    """呼叫 Gemini API 進行大阪行程合理性、交通順暢度與推薦分析"""
+    gemini_key = st.secrets.get("gemini_api_key", "").strip()
+    if not gemini_key:
+        return "⚠️ 尚未設定 `gemini_api_key`！請在 Streamlit Secrets 貼上免費的 Google AI Studio API Key 即可啟用 AI 旅遊小助手。"
+
+    try:
+        from google import genai
+        client = genai.Client(api_key=gemini_key)
+
+        itin_text = "（目前尚未排入任何每日行程）"
+        if not df_itin.empty:
+            lines = []
+            for _, r in df_itin.iterrows():
+                lines.append(
+                    f"- {r['天數']} ({r['日期']}) {r['時間']} | {r['行程名稱']} [{r['分類']}] | 車站：{r['最近車站']} | 備註：{r['備註']}"
+                )
+            itin_text = "\n".join(lines)
+
+        pool_text = "（目前清單無資料）"
+        if not df_links.empty:
+            p_lines = []
+            for _, r in df_links.iterrows():
+                name = str(r["自訂名稱"]).strip() or str(r["自動抓取標題"]).strip()
+                p_lines.append(
+                    f"- {name}（區域：{r['區域']}｜分類：{r['分類']}｜車站：{r['最近地鐵站']}｜備註：{r['備註']}）"
+                )
+            pool_text = "\n".join(p_lines)
+
+        system_context = f"""
+你是一位專業、貼心且熟悉日本大阪、京都、神戶、奈良自由行的「AI 旅遊規劃小助手」。
+請根據以下這組旅客的真實行程與收藏清單，用繁體中文給出具體、實用、條理分明的建議（包含地鐵/電鐵路線順暢度、是否走回頭路、營業時間/排隊提醒、體力分配建議等）。
+
+【旅程天數資訊】
+{trip_days_info}
+
+【目前已排入的每日行程表】
+{itin_text}
+
+【全團收藏的願望清單（含尚未排入的景點與美食）】
+{pool_text}
+
+【使用者提問】
+{user_prompt}
+"""
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=system_context
+        )
+        return response.text
+    except Exception as e:
+        return f"⚠️ AI 小助手連線發生錯誤：{e}"
 
 # ==========================================
 # 5. Google Places API (New) 座標與全鐵道解析
@@ -633,9 +704,9 @@ def build_route_comparison_row(orig_obj, dest_obj):
     }
 
 # ==========================================
-# 6. 產生美化 Excel 報表
+# 6. 產生美化 Excel 報表（含每日行程表分頁）
 # ==========================================
-def generate_styled_excel(df_links):
+def generate_styled_excel(df_links, df_itin=None):
     all_list = []
     food_list, shop_list, spot_list, other_list = [], [], [], []
     sheet_updated = False
@@ -743,6 +814,11 @@ def generate_styled_excel(df_links):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         sheets_written = []
+        if df_itin is not None and not df_itin.empty:
+            df_itin_sorted = df_itin.sort_values(by=["天數", "時間"]).copy()
+            df_itin_sorted.to_excel(writer, sheet_name="📅 每日行程表", index=False)
+            sheets_written.append("📅 每日行程表")
+
         sheet_map = [
             (df_all, "📋 總表"),
             (df_food, "🍔 美食指南"),
@@ -905,11 +981,12 @@ if st.session_state["workspace_area"] is None:
             st.subheader("🌍 大家共用區（團隊協作）")
             st.write("所有同行夥伴共同編輯與查詢的旅遊大本營：")
             st.markdown("""
+            * 📅 **每日行程排程器 ＆ AI 顧問**：日曆排程、時間軸/表格雙視角、AI 健檢路線
             * 📋 **共用旅遊清單**：瀏覽所有美食、購物、景點與最近車站
             * 🧭 **路線與距離試算**：飯店/機場雙向路線、任意兩定點對比
             * ➕ **新增 / ✏️ 修改景點**：自動解析 Google 地圖與鐵道轉乘
             * 💰 **共同支出＆分帳計算機**：記錄代墊款項，即時匯率合併結算誰給誰錢
-            * 📊 **匯出精美 Excel**：自動按區域上色分類下載
+            * 📊 **匯出精美 Excel**：含每日行程表與各分類上色分頁
             """)
             st.write("")
             if st.button("🌍 進入【大家共用區】", type="primary", use_container_width=True):
@@ -925,6 +1002,7 @@ if st.session_state["workspace_area"] is None:
             * 💱 **即時市場匯率換算**：自動抓取最新日幣匯率，勾選「已買到 ✅」即時統計花費
             * 🧳 **個人行李打包清單**：一鍵匯入日本自由行常用清單並勾選確認
             """)
+            st.write("")
             st.write("")
             st.write("")
             st.write("")
@@ -971,7 +1049,8 @@ if st.session_state["workspace_area"] == "shared":
     key_badge = "✅ Google 地圖 API 已連線" if has_gmap_key else "⚠️ 尚未偵測到 Google 地圖 API 金鑰"
     st.caption(f"📊 目前共收錄 **{len(df_links)}** 筆景點與美食 ｜ {key_badge} ｜ [📄 開啟 Google 雲端試算表]({st.secrets['sheet_url']})")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab_itin, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📅 每日行程排程 ＆ AI 顧問",
         "📋 共用旅遊清單",
         "🧭 路線與距離試算",
         "➕ 新增連結",
@@ -979,6 +1058,288 @@ if st.session_state["workspace_area"] == "shared":
         "💰 共同支出＆分帳計算機",
         "📊 匯出精美 Excel"
     ])
+
+    # --- 共用分頁 0：📅 每日行程排程器 ＆ AI 旅遊顧問 ---
+    with tab_itin:
+        st.subheader("📅 直覺式每日行程排程器 ＆ 🤖 AI 路線顧問")
+
+        # 步驟 1：日曆設定旅程日期
+        saved_start, saved_end = load_trip_dates()
+        with st.container(border=True):
+            st.markdown("**步驟 1️⃣：在日曆選擇旅程的「出發日」與「回程日」**")
+            d_col1, d_col2, d_col3 = st.columns([2, 2, 1])
+            default_s = saved_start if saved_start else datetime.date.today() + timedelta(days=14)
+            default_e = saved_end if saved_end else default_s + timedelta(days=4)
+
+            with d_col1:
+                pick_start = st.date_input("🛫 出發日期", value=default_s)
+            with d_col2:
+                pick_end = st.date_input("🛬 回程日期", value=max(default_e, pick_start))
+            with d_col3:
+                st.write("")
+                st.write("")
+                if st.button("💾 儲存旅程日期", type="primary", use_container_width=True):
+                    if pick_end < pick_start:
+                        st.error("❌ 回程日期不能早於出發日期喔！")
+                    else:
+                        save_trip_dates(pick_start, pick_end)
+                        st.success("✅ 已同步儲存全團旅程日期！")
+                        st.rerun()
+
+            active_start = saved_start if saved_start else pick_start
+            active_end = saved_end if saved_end else pick_end
+            total_days = (active_end - active_start).days + 1
+            st.caption(f"🗓️ 目前設定：**{active_start.strftime('%Y/%m/%d')} ({WEEKDAY_ZH[active_start.weekday()]})** ～ **{active_end.strftime('%Y/%m/%d')} ({WEEKDAY_ZH[active_end.weekday()]})**，共 **{total_days} 天 {max(0, total_days - 1)} 夜**")
+
+        # 建立 Day 1 ~ Day N 選單標籤
+        day_options = []
+        day_date_map = {}
+        for d_idx in range(total_days):
+            cur_d = active_start + timedelta(days=d_idx)
+            w_str = WEEKDAY_ZH[cur_d.weekday()]
+            day_tag = f"Day {d_idx + 1}"
+            full_label = f"{day_tag}（{cur_d.strftime('%m/%d')} {w_str}）"
+            day_options.append(full_label)
+            day_date_map[full_label] = (day_tag, f"{cur_d.strftime('%Y-%m-%d')} ({w_str})")
+
+        ws_itin = get_or_create_ws("每日行程", ITINERARY_COLS)
+        df_itin = load_sheet_df(ws_itin, ITINERARY_COLS)
+
+        # 步驟 2：快速加入行程項目
+        with st.container(border=True):
+            st.markdown("**步驟 2️⃣：將景點或活動排入行程**")
+            add_source = st.radio(
+                "選擇加入方式：",
+                ["📋 從「共用旅遊清單」挑選景點", "✏️ 手動輸入自訂行程（如：搭飛機、飯店 Check-in、自由逛街）"],
+                horizontal=True
+            )
+
+            with st.form("add_itinerary_form", clear_on_submit=True):
+                ic1, ic2, ic3 = st.columns([2, 1.2, 3.8])
+                with ic1:
+                    sel_day_label = st.selectbox("選擇第幾天 *", day_options)
+                with ic2:
+                    sel_time = st.time_input("預計時間 *", value=datetime.time(10, 0), step=900)
+
+                if add_source.startswith("📋"):
+                    with ic3:
+                        if df_links.empty:
+                            st.warning("共用清單目前是空的，請切換為「手動輸入自訂行程」或先去新增景點！")
+                            sel_spot_idx = None
+                        else:
+                            spot_choices = {}
+                            for idx, r in df_links.iterrows():
+                                s_title = str(r["自訂名稱"]).strip() or str(r["自動抓取標題"]).strip() or str(r["網址"])[:30]
+                                s_lbl = f"[{idx}] {s_title}（{r['區域']}｜{r['分類']}）"
+                                spot_choices[s_lbl] = idx
+                            chosen_spot_lbl = st.selectbox("選擇要排入的景點 *", list(spot_choices.keys()))
+                            sel_spot_idx = spot_choices[chosen_spot_lbl]
+                    in_note = st.text_input("行程備註（選填）", placeholder="例如：已訂位 18:30、記得先抽整理券")
+                else:
+                    with ic3:
+                        custom_itin_name = st.text_input("行程 / 活動名稱 *", placeholder="例如：抵達關西機場、飯店寄放行李、心齋橋自由購物")
+                    ic4, ic5 = st.columns([2, 4])
+                    with ic4:
+                        custom_itin_cat = st.selectbox("分類", CAT_OPTIONS)
+                    with ic5:
+                        in_note = st.text_input("行程備註（選填）", placeholder="例如：搭乘南海電鐵特急 Rapi:t")
+
+                if st.form_submit_button("➕ 加入該日行程表", type="primary"):
+                    day_tag, date_str = day_date_map[sel_day_label]
+                    time_str = sel_time.strftime("%H:%M")
+
+                    if add_source.startswith("📋"):
+                        if df_links.empty or sel_spot_idx is None:
+                            st.warning("⚠️ 請先在共用清單新增景點，或改用手動輸入！")
+                        else:
+                            r = df_links.loc[sel_spot_idx]
+                            s_title = str(r["自訂名稱"]).strip() or str(r["自動抓取標題"]).strip()
+                            orig_note = str(r["備註"]).strip()
+                            merged_note = f"{in_note.strip()}（{orig_note}）" if (in_note.strip() and orig_note) else (in_note.strip() or orig_note)
+
+                            new_it = pd.DataFrame([{
+                                "天數": day_tag,
+                                "日期": date_str,
+                                "時間": time_str,
+                                "行程名稱": s_title,
+                                "分類": str(r["分類"]).strip(),
+                                "最近車站": str(r["最近地鐵站"]).strip(),
+                                "網址": str(r["網址"]).strip(),
+                                "備註": merged_note,
+                                "排程者": current_user
+                            }])
+                            df_itin = pd.concat([df_itin, new_it], ignore_index=True)
+                            save_sheet_df(ws_itin, df_itin, ITINERARY_COLS)
+                            st.success(f"✅ 已將「{s_title}」排入 {sel_day_label} {time_str}！")
+                            st.rerun()
+                    else:
+                        if not custom_itin_name.strip():
+                            st.warning("⚠️ 請輸入行程名稱喔！")
+                        else:
+                            new_it = pd.DataFrame([{
+                                "天數": day_tag,
+                                "日期": date_str,
+                                "時間": time_str,
+                                "行程名稱": custom_itin_name.strip(),
+                                "分類": custom_itin_cat,
+                                "最近車站": "-",
+                                "網址": "",
+                                "備註": in_note.strip(),
+                                "排程者": current_user
+                            }])
+                            df_itin = pd.concat([df_itin, new_it], ignore_index=True)
+                            save_sheet_df(ws_itin, df_itin, ITINERARY_COLS)
+                            st.success(f"✅ 已將「{custom_itin_name.strip()}」排入 {sel_day_label} {time_str}！")
+                            st.rerun()
+
+        st.divider()
+
+        # 步驟 3：行程呈現（時間軸模式 vs 表格模式自由切換）
+        view_c1, view_c2 = st.columns([2, 2])
+        with view_c1:
+            view_mode = st.radio(
+                "👀 選擇行程呈現模式：",
+                ["⏳ 時間軸卡片模式（按天切換，適合手機看動線）", "📊 總覽表格模式（一眼看全趟行程表）"],
+                horizontal=True
+            )
+        with view_c2:
+            filter_day_choice = st.selectbox("篩選檢視天數：", ["全部天數總覽"] + day_options)
+
+        if df_itin.empty:
+            st.info("目前行程表還是空的，快從上方步驟 2 開始把景點排進每一天吧！")
+        else:
+            # 依天數編號與時間排序
+            df_itin["_day_num"] = df_itin["天數"].apply(
+                lambda x: int(re.search(r'\d+', str(x)).group(0)) if re.search(r'\d+', str(x)) else 999
+            )
+            df_itin_sorted = df_itin.sort_values(by=["_day_num", "時間"]).copy()
+
+            if filter_day_choice != "全部天數總覽":
+                target_d_tag = day_date_map[filter_day_choice][0]
+                df_show_itin = df_itin_sorted[df_itin_sorted["天數"] == target_d_tag].copy()
+            else:
+                df_show_itin = df_itin_sorted.copy()
+
+            # 模式 1：⏳ 時間軸卡片模式
+            if view_mode.startswith("⏳"):
+                if df_show_itin.empty:
+                    st.info(f"「{filter_day_choice}」目前還沒有安排任何行程喔！")
+                else:
+                    for day_tag, group in df_show_itin.groupby("天數", sort=False):
+                        date_label = group.iloc[0]["日期"]
+                        st.markdown(f"### 🗓️ {day_tag} ｜ {date_label}")
+
+                        # 產生當日 Google Maps 多點串連路線按鈕
+                        places_for_route = [
+                            urllib.parse.quote(f"大阪 {str(row['行程名稱']).strip()}")
+                            for _, row in group.iterrows()
+                            if str(row["分類"]).strip() != "交通/住宿" or len(group) <= 2
+                        ]
+                        if len(places_for_route) >= 2:
+                            origin_p = places_for_route[0]
+                            dest_p = places_for_route[-1]
+                            waypoints = "|".join(places_for_route[1:-1])
+                            multi_route_url = (
+                                f"https://www.google.com/maps/dir/?api=1"
+                                f"&origin={origin_p}&destination={dest_p}"
+                                + (f"&waypoints={waypoints}" if waypoints else "")
+                                + "&travelmode=transit"
+                            )
+                            st.markdown(f"👉 **[🗺️ 一鍵開啟 {day_tag} 完整順路多點導航（共 {len(places_for_route)} 站）]({multi_route_url})**")
+
+                        for orig_idx, row in group.iterrows():
+                            with st.container(border=True):
+                                t_c1, t_c2, t_c3 = st.columns([1.2, 5.8, 1.5])
+                                with t_c1:
+                                    st.markdown(f"#### ⏰ {row['時間']}")
+                                    st.caption(f"🏷️ {row['分類']}")
+                                with t_c2:
+                                    st.markdown(f"**{row['行程名稱']}**")
+                                    if str(row["最近車站"]).strip() and str(row["最近車站"]).strip() != "-":
+                                        st.caption(f"🚉 {row['最近車站']}")
+                                    if str(row["備註"]).strip():
+                                        st.write(f"📝 {row['備註']}")
+                                with t_c3:
+                                    if str(row["網址"]).strip().startswith("http"):
+                                        st.link_button("🔗 連結", str(row["網址"]).strip(), use_container_width=True)
+                                    if st.button("🗑️ 移除", key=f"del_itin_{orig_idx}", use_container_width=True):
+                                        df_itin = df_itin.drop(orig_idx).drop(columns=["_day_num"], errors="ignore").reset_index(drop=True)
+                                        save_sheet_df(ws_itin, df_itin, ITINERARY_COLS)
+                                        st.rerun()
+
+            # 模式 2：📊 總覽表格模式
+            else:
+                table_df = df_show_itin[["天數", "日期", "時間", "行程名稱", "分類", "最近車站", "備註", "網址", "排程者"]].copy()
+                st.dataframe(
+                    table_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "網址": st.column_config.LinkColumn("網址", display_text="🔗 開啟")
+                    }
+                )
+                with st.expander("🗑️ 刪除特定行程項目"):
+                    del_opts = [
+                        f"[{idx}] {r['天數']} {r['時間']}｜{r['行程名稱']}"
+                        for idx, r in df_itin_sorted.iterrows()
+                    ]
+                    sel_del_it = st.selectbox("選擇要移除的行程：", del_opts)
+                    if st.button("確認移除此行程", type="secondary"):
+                        del_idx = int(sel_del_it.split("]")[0].replace("[", ""))
+                        df_itin = df_itin.drop(del_idx).drop(columns=["_day_num"], errors="ignore").reset_index(drop=True)
+                        save_sheet_df(ws_itin, df_itin, ITINERARY_COLS)
+                        st.success("✅ 已從行程表移除！")
+                        st.rerun()
+
+        st.divider()
+
+        # 步驟 4：🤖 AI 旅遊規劃小助手
+        with st.container(border=True):
+            st.subheader("🤖 AI 旅遊規劃小助手（行程健檢 ＆ 交通顧問）")
+            has_gemini = bool(st.secrets.get("gemini_api_key", "").strip())
+
+            if not has_gemini:
+                st.info("""
+                💡 **尚未啟用 AI 小助手（設定只需 30 秒且完全免費）**：
+                1. 前往 Google 官方的 **[Google AI Studio](https://aistudio.google.com/apikey)**，登入 Google 帳號並點 **「Create API key」** 複製金鑰。
+                2. 打開 Streamlit 右下角 **Manage app → Settings → Secrets**，在最下方新增一行：
+                   `gemini_api_key = "AIzaSy你的免費金鑰"` 並按 Save 即可開始跟 AI 對話！
+                """)
+            else:
+                st.caption("AI 小助手已自動讀取你們目前的「每日行程表」與「全團收藏清單」，你可以點下方快捷按鈕或直接發問：")
+                q_b1, q_b2, q_b3 = st.columns(3)
+                quick_ai_prompt = ""
+                with q_b1:
+                    if st.button("🔍 幫我健檢目前排程順不順？", use_container_width=True):
+                        quick_ai_prompt = "請幫我檢查目前已經排入的每日行程，分析每天的交通路線是否順路、有沒有走回頭路、時間會不會太趕或太鬆，並給出具體調整建議。"
+                with q_b2:
+                    if st.button("🧩 還沒排的景點怎麼塞進空檔？", use_container_width=True):
+                        quick_ai_prompt = "請比對『已排入的每日行程』與『全團收藏清單中還沒排進去的景點/美食』，幫我推薦哪些未排入的店剛好順路可以塞進哪一天的空檔？"
+                with q_b3:
+                    if st.button("🌧️ 幫我規劃雨天備案與排隊提醒", use_container_width=True):
+                        quick_ai_prompt = "針對我們目前的行程與收藏清單，請問有哪些餐廳需要提前預約或排隊很久？如果遇到下雨天，哪幾天的行程需要準備室內雨天備案？"
+
+                user_ai_q = st.text_area(
+                    "💬 或者直接輸入你想問 AI 小助手的問題：",
+                    value=quick_ai_prompt,
+                    height=90,
+                    placeholder="例如：Day 2 早上想去環球影城，晚上還排得下心齋橋吃燒肉嗎？車程大概要多久？"
+                )
+
+                if st.button("✨ 請 AI 小助手分析建議", type="primary"):
+                    if not user_ai_q.strip():
+                        st.warning("⚠️ 請先輸入問題或點擊上方快捷按鈕喔！")
+                    else:
+                        trip_info_str = f"{active_start.strftime('%Y/%m/%d')} 至 {active_end.strftime('%Y/%m/%d')}（共 {total_days} 天）"
+                        with st.spinner("🤖 AI 小助手正在比對所有景點車站與行程動線中..."):
+                            ai_reply = ask_travel_ai_assistant(
+                                user_ai_q.strip(),
+                                df_itin.drop(columns=["_day_num"], errors="ignore"),
+                                df_links,
+                                trip_info_str
+                            )
+                        st.markdown("### 💡 AI 顧問分析報告")
+                        st.markdown(ai_reply)
 
     # --- 共用分頁 1：瀏覽共用清單 ---
     with tab1:
@@ -1482,7 +1843,6 @@ if st.session_state["workspace_area"] == "shared":
             st.info("目前還沒有任何共同支出紀錄，第一筆代墊由你開始記錄吧！")
         else:
             st.markdown("### 📜 所有共同支出明細")
-            # 顯示明細時自動附帶「約合台幣」參考欄
             disp_exp = df_exp.copy()
             def calc_twd_preview(r):
                 try:
@@ -1510,7 +1870,6 @@ if st.session_state["workspace_area"] == "shared":
 
             st.divider()
 
-            # 結算模式選擇：各幣別分開結算 vs 即時匯率合併台幣一次結清
             st.markdown("### 🧮 自動分帳結算結果（誰該給誰多少錢）")
             settle_mode = st.radio(
                 "選擇結算方式：",
@@ -1571,12 +1930,12 @@ if st.session_state["workspace_area"] == "shared":
 
     # --- 共用分頁 6：匯出精美 Excel ---
     with tab6:
-        st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、依區域上色分類，並產生包含「總表」與各分類分頁的 Excel 檔案。")
-        if df_links.empty:
+        st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、依區域上色分類，並產生包含「每日行程表」、「總表」與各分類分頁的 Excel 檔案。")
+        if df_links.empty and df_itin.empty:
             st.info("目前沒有資料可以匯出喔！")
         else:
             if st.button("🚀 開始統整並產生 Excel", type="primary"):
-                excel_data = generate_styled_excel(df_links.copy())
+                excel_data = generate_styled_excel(df_links.copy(), df_itin.copy())
                 ts = datetime.datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S")
                 st.session_state["excel_bytes"] = excel_data
                 st.session_state["excel_filename"] = f"大阪旅遊統整表_{ts}.xlsx"
@@ -1610,7 +1969,6 @@ else:
 
         live_rate, rate_status, _ = fetch_live_jpy_to_twd()
 
-        # 匯率設定（自動帶入即時市場匯率）與預算儀表板
         rate_col, m1, m2, m3 = st.columns([1.4, 1, 1, 1])
         with rate_col:
             jpy_rate = st.number_input(
