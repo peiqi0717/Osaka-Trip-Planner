@@ -1,5 +1,6 @@
 import io
 import re
+import time
 import json
 import math
 import hashlib
@@ -252,7 +253,7 @@ def fetch_live_jpy_to_twd():
     return 0.2150, "⚠️ 離線預設參考匯率（可手動調整）", False
 
 # ==========================================
-# 3. 連接 Google 試算表 (多分頁永久資料庫)
+# 3. 連接 Google 試算表 (含防限流快取與自動重試保護)
 # ==========================================
 @st.cache_resource
 def get_spreadsheet():
@@ -265,55 +266,99 @@ def get_spreadsheet():
     client = gspread.authorize(creds)
     return client.open_by_url(st.secrets["sheet_url"])
 
+def _retry_gspread(func, *args, **kwargs):
+    """遇到 Google API 暫時性限流 (429) 時自動稍候重試，避免畫面跳紅字"""
+    for attempt in range(4):
+        try:
+            return func(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            if attempt < 3:
+                time.sleep(1.5 * (attempt + 1))
+            else:
+                raise e
+
 def get_or_create_ws(title, default_cols):
-    sh = get_spreadsheet()
-    try:
-        ws = sh.worksheet(title)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows=500, cols=len(default_cols) + 2)
-        ws.append_row(default_cols)
-    return ws
+    def _op():
+        sh = get_spreadsheet()
+        try:
+            ws = sh.worksheet(title)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=title, rows=500, cols=len(default_cols) + 2)
+            ws.append_row(default_cols)
+        return ws
+    return _retry_gspread(_op)
 
-def load_sheet_df(ws, default_cols, defaults_map=None):
-    records = ws.get_all_values()
-    if not records:
-        ws.append_row(default_cols)
-        return pd.DataFrame(columns=default_cols)
+@st.cache_data(ttl=45, show_spinner=False)
+def _cached_read_sheet(sheet_key, default_cols_tuple, defaults_items_tuple):
+    default_cols = list(default_cols_tuple)
+    defaults_map = dict(defaults_items_tuple)
 
-    headers = records[0]
-    rows = records[1:]
-    df = pd.DataFrame(rows, columns=headers)
+    def _op():
+        sh = get_spreadsheet()
+        if sheet_key == "__MAIN__":
+            ws = sh.sheet1
+        else:
+            try:
+                ws = sh.worksheet(sheet_key)
+            except gspread.WorksheetNotFound:
+                ws = sh.add_worksheet(title=sheet_key, rows=500, cols=len(default_cols) + 2)
+                ws.append_row(default_cols)
 
-    added = False
-    for col in default_cols:
-        if col not in df.columns:
-            df[col] = defaults_map.get(col, "") if defaults_map else ""
-            added = True
+        records = ws.get_all_values()
+        if not records:
+            ws.append_row(default_cols)
+            return pd.DataFrame(columns=default_cols)
 
-    df = df[default_cols].fillna("")
-    if added:
-        save_sheet_df(ws, df, default_cols)
-    return df
+        headers = records[0]
+        rows = records[1:]
+        df = pd.DataFrame(rows, columns=headers)
 
-def save_sheet_df(ws, df, default_cols):
-    df_clean = df[default_cols].fillna("").astype(str)
-    ws.clear()
-    ws.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
+        added = False
+        for col in default_cols:
+            if col not in df.columns:
+                df[col] = defaults_map.get(col, "")
+                added = True
 
-def get_main_worksheet():
-    return get_spreadsheet().sheet1
+        df = df[default_cols].fillna("")
+        if added:
+            df_clean = df[default_cols].fillna("").astype(str)
+            ws.clear()
+            ws.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
+        return df
+
+    return _retry_gspread(_op)
+
+def load_sheet_df(ws_or_title, default_cols, defaults_map=None):
+    sheet_key = ws_or_title if isinstance(ws_or_title, str) else ws_or_title.title
+    defaults_tuple = tuple(defaults_map.items()) if defaults_map else ()
+    return _cached_read_sheet(sheet_key, tuple(default_cols), defaults_tuple).copy()
+
+def save_sheet_df(ws_or_title, df, default_cols):
+    def _op():
+        if isinstance(ws_or_title, str):
+            sh = get_spreadsheet()
+            ws = sh.sheet1 if ws_or_title == "__MAIN__" else sh.worksheet(ws_or_title)
+        else:
+            ws = ws_or_title
+        df_clean = df[default_cols].fillna("").astype(str)
+        ws.clear()
+        ws.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
+
+    _retry_gspread(_op)
+    _cached_read_sheet.clear()
 
 def load_data():
-    ws = get_main_worksheet()
-    return load_sheet_df(ws, DEFAULT_COLS, {"分類": "未分類", "區域": "其他/未指定"})
+    return _cached_read_sheet(
+        "__MAIN__",
+        tuple(DEFAULT_COLS),
+        (("分類", "未分類"), ("區域", "其他/未指定"))
+    ).copy()
 
 def save_data(df):
-    ws = get_main_worksheet()
-    save_sheet_df(ws, df, DEFAULT_COLS)
+    save_sheet_df("__MAIN__", df, DEFAULT_COLS)
 
 def load_trip_dates():
-    ws_meta = get_or_create_ws("旅遊設定", META_COLS)
-    df_meta = load_sheet_df(ws_meta, META_COLS)
+    df_meta = load_sheet_df("旅遊設定", META_COLS)
     meta_dict = dict(zip(df_meta["設定鍵"], df_meta["設定值"]))
     start_str = meta_dict.get("start_date", "")
     end_str = meta_dict.get("end_date", "")
@@ -328,7 +373,7 @@ def load_trip_dates():
 
 def save_trip_dates(start_date, end_date):
     ws_meta = get_or_create_ws("旅遊設定", META_COLS)
-    df_meta = load_sheet_df(ws_meta, META_COLS)
+    df_meta = load_sheet_df("旅遊設定", META_COLS)
     df_meta = df_meta[~df_meta["設定鍵"].isin(["start_date", "end_date"])].copy()
     new_rows = pd.DataFrame([
         {"設定鍵": "start_date", "設定值": start_date.isoformat()},
@@ -339,8 +384,7 @@ def save_trip_dates(start_date, end_date):
 
 def load_user_tab_order(username):
     """讀取該使用者自訂的共用區分頁順序"""
-    ws_meta = get_or_create_ws("旅遊設定", META_COLS)
-    df_meta = load_sheet_df(ws_meta, META_COLS)
+    df_meta = load_sheet_df("旅遊設定", META_COLS)
     meta_dict = dict(zip(df_meta["設定鍵"], df_meta["設定值"]))
     raw_order = meta_dict.get(f"tab_order_{username}", "")
     if raw_order:
@@ -354,7 +398,7 @@ def load_user_tab_order(username):
 def save_user_tab_order(username, ordered_keys):
     """儲存該使用者自訂的共用區分頁順序"""
     ws_meta = get_or_create_ws("旅遊設定", META_COLS)
-    df_meta = load_sheet_df(ws_meta, META_COLS)
+    df_meta = load_sheet_df("旅遊設定", META_COLS)
     key_name = f"tab_order_{username}"
     df_meta = df_meta[df_meta["設定鍵"] != key_name].copy()
     new_row = pd.DataFrame([{"設定鍵": key_name, "設定值": ",".join(ordered_keys)}])
@@ -1161,7 +1205,7 @@ if not st.session_state["auth_user"]:
                     else:
                         with st.spinner("正在驗證身分..."):
                             ws_users = get_or_create_ws("使用者帳號", USER_COLS)
-                            df_users = load_sheet_df(ws_users, USER_COLS)
+                            df_users = load_sheet_df("使用者帳號", USER_COLS)
                             hashed = hash_pin(input_nick, input_pin)
 
                             matched = df_users[df_users["暱稱"].str.strip() == input_nick]
@@ -1279,10 +1323,8 @@ st.divider()
 # ==============================================================================
 if st.session_state["workspace_area"] == "shared":
     df_links = load_data()
-    ws_hotels = get_or_create_ws("住宿飯店", HOTEL_COLS)
-    df_hotels = load_sheet_df(ws_hotels, HOTEL_COLS)
-    ws_notes = get_or_create_ws("共用筆記", NOTE_COLS)
-    df_notes = load_sheet_df(ws_notes, NOTE_COLS)
+    df_hotels = load_sheet_df("住宿飯店", HOTEL_COLS)
+    df_notes = load_sheet_df("共用筆記", NOTE_COLS)
 
     has_gmap_key = bool(st.secrets.get("google_maps_api_key", "").strip())
     key_badge = "✅ Google 地圖 API 已連線" if has_gmap_key else "⚠️ 尚未偵測到 Google 地圖 API 金鑰"
@@ -1291,24 +1333,42 @@ if st.session_state["workspace_area"] == "shared":
     # 讀取當前使用者專屬的分頁排列順序
     user_tab_keys = load_user_tab_order(current_user)
 
-    with st.expander("⚙️ 自訂共用區分頁順序（依照你覺得重要的程度，把常用的分頁排到最前面）"):
-        st.caption("💡 依照你希望出現的「由左至右」順序依序點選分頁（若有未選到的分頁，系統會自動補排在後方），設定僅影響你的帳號視角！")
-        label_to_key = {v: k for k, v in SHARED_TAB_LABELS.items()}
-        current_ordered_labels = [SHARED_TAB_LABELS[k] for k in user_tab_keys]
+    with st.expander("⚙️ 自訂共用區分頁順序（修改數字 1～10 即可把重要的分頁排到最前面）"):
+        st.caption("💡 直接點擊「顯示順序」欄位修改數字（數字越小越靠左），調整完畢後按下方 **「💾 套用並儲存我的排序」** 即可（設定僅影響你的帳號視角）：")
 
-        picked_labels = st.multiselect(
-            "請依序排列分頁（越前面越靠左）：",
-            options=[SHARED_TAB_LABELS[k] for k in SHARED_TAB_KEYS],
-            default=current_ordered_labels
+        order_df = pd.DataFrame([
+            {
+                "顯示順序": idx + 1,
+                "分頁名稱": SHARED_TAB_LABELS[k],
+                "_key": k
+            }
+            for idx, k in enumerate(user_tab_keys)
+        ])
+
+        edited_order_df = st.data_editor(
+            order_df[["顯示順序", "分頁名稱"]],
+            use_container_width=True,
+            hide_index=True,
+            disabled=["分頁名稱"],
+            column_config={
+                "顯示順序": st.column_config.NumberColumn(
+                    "顯示順序（1 = 最左邊）",
+                    min_value=1,
+                    max_value=len(SHARED_TAB_KEYS),
+                    step=1,
+                    format="%d"
+                )
+            },
+            key=f"tab_order_editor_{current_user}"
         )
 
-        ord_c1, ord_c2, _ = st.columns([1.5, 1.5, 4])
+        ord_c1, ord_c2, _ = st.columns([1.8, 1.8, 3.4])
         with ord_c1:
             if st.button("💾 套用並儲存我的排序", type="primary", use_container_width=True):
-                new_keys = [label_to_key[lbl] for lbl in picked_labels]
-                for k in SHARED_TAB_KEYS:
-                    if k not in new_keys:
-                        new_keys.append(k)
+                merged_ord = order_df.copy()
+                merged_ord["顯示順序"] = edited_order_df["顯示順序"].fillna(99).astype(int)
+                merged_ord = merged_ord.sort_values(by=["顯示順序"], kind="stable")
+                new_keys = merged_ord["_key"].tolist()
                 save_user_tab_order(current_user, new_keys)
                 st.success("✅ 已儲存你的專屬分頁順序！")
                 st.rerun()
@@ -1324,8 +1384,7 @@ if st.session_state["workspace_area"] == "shared":
     tab_map = dict(zip(user_tab_keys, created_tabs))
 
     saved_start, saved_end = load_trip_dates()
-    ws_itin = get_or_create_ws("每日行程", ITINERARY_COLS)
-    df_itin = load_sheet_df(ws_itin, ITINERARY_COLS)
+    df_itin = load_sheet_df("每日行程", ITINERARY_COLS)
 
     # --- 分頁：📅 每日行程排程器 ＆ AI 旅遊顧問 ---
     with tab_map["itin"]:
@@ -1447,7 +1506,7 @@ if st.session_state["workspace_area"] == "shared":
                                 "排程者": current_user
                             }])
                             df_itin = pd.concat([df_itin, new_it], ignore_index=True)
-                            save_sheet_df(ws_itin, df_itin, ITINERARY_COLS)
+                            save_sheet_df("每日行程", df_itin, ITINERARY_COLS)
                             st.success(f"✅ 已將「{s_title}」排入 {sel_day_label} {time_str}！")
                             st.rerun()
                     else:
@@ -1466,7 +1525,7 @@ if st.session_state["workspace_area"] == "shared":
                                 "排程者": current_user
                             }])
                             df_itin = pd.concat([df_itin, new_it], ignore_index=True)
-                            save_sheet_df(ws_itin, df_itin, ITINERARY_COLS)
+                            save_sheet_df("每日行程", df_itin, ITINERARY_COLS)
                             st.success(f"✅ 已將「{custom_itin_name.strip()}」排入 {sel_day_label} {time_str}！")
                             st.rerun()
 
@@ -1556,7 +1615,7 @@ if st.session_state["workspace_area"] == "shared":
                                                 })
                                             df_itin_clean = df_itin.drop(columns=["_day_num"], errors="ignore")
                                             df_itin_clean = pd.concat([df_itin_clean, pd.DataFrame(added_rows)], ignore_index=True)
-                                            save_sheet_df(ws_itin, df_itin_clean, ITINERARY_COLS)
+                                            save_sheet_df("每日行程", df_itin_clean, ITINERARY_COLS)
                                             st.rerun()
 
                         places_for_route = [
@@ -1604,7 +1663,7 @@ if st.session_state["workspace_area"] == "shared":
                                         if st.button("💾 更新時間", key=f"save_time_{orig_idx}", type="primary", use_container_width=True):
                                             df_itin.at[orig_idx, "時間"] = new_t_obj.strftime("%H:%M")
                                             df_itin_clean = df_itin.drop(columns=["_day_num"], errors="ignore")
-                                            save_sheet_df(ws_itin, df_itin_clean, ITINERARY_COLS)
+                                            save_sheet_df("每日行程", df_itin_clean, ITINERARY_COLS)
                                             st.rerun()
                                     st.caption(f"🏷️ {row['分類']}")
 
@@ -1620,7 +1679,7 @@ if st.session_state["workspace_area"] == "shared":
                                         st.link_button("🔗 連結", str(row["網址"]).strip(), use_container_width=True)
                                     if st.button("🗑️ 移除", key=f"del_itin_{orig_idx}", use_container_width=True):
                                         df_itin = df_itin.drop(orig_idx).drop(columns=["_day_num"], errors="ignore").reset_index(drop=True)
-                                        save_sheet_df(ws_itin, df_itin, ITINERARY_COLS)
+                                        save_sheet_df("每日行程", df_itin, ITINERARY_COLS)
                                         st.rerun()
 
                             if pos_i < len(group_items) - 1:
@@ -1665,7 +1724,7 @@ if st.session_state["workspace_area"] == "shared":
                     if st.button("確認移除此行程", type="secondary"):
                         del_idx = int(sel_del_it.split("]")[0].replace("[", ""))
                         df_itin = df_itin.drop(del_idx).drop(columns=["_day_num"], errors="ignore").reset_index(drop=True)
-                        save_sheet_df(ws_itin, df_itin, ITINERARY_COLS)
+                        save_sheet_df("每日行程", df_itin, ITINERARY_COLS)
                         st.success("✅ 已從行程表移除！")
                         st.rerun()
 
@@ -1769,7 +1828,7 @@ if st.session_state["workspace_area"] == "shared":
                             "新增者": current_user
                         }])
                         df_hotels = pd.concat([df_hotels, new_h], ignore_index=True)
-                        save_sheet_df(ws_hotels, df_hotels, HOTEL_COLS)
+                        save_sheet_df("住宿飯店", df_hotels, HOTEL_COLS)
                         st.success(f"✅ 已成功新增飯店「{h_name.strip()}」！")
                         st.rerun()
 
@@ -1813,7 +1872,7 @@ if st.session_state["workspace_area"] == "shared":
 
                         if st.button("🗑️ 刪除飯店", key=f"del_hotel_{h_idx}", use_container_width=True):
                             df_hotels = df_hotels.drop(h_idx).reset_index(drop=True)
-                            save_sheet_df(ws_hotels, df_hotels, HOTEL_COLS)
+                            save_sheet_df("住宿飯店", df_hotels, HOTEL_COLS)
                             st.success("✅ 已刪除此間飯店！")
                             st.rerun()
 
@@ -1873,7 +1932,7 @@ if st.session_state["workspace_area"] == "shared":
                                 df_hotels.at[h_idx, "退房時間"] = e_co_t.strftime("%H:%M")
                                 df_hotels.at[h_idx, "最近車站"] = final_h_sub
                                 df_hotels.at[h_idx, "訂房備註"] = e_h_note.strip()
-                                save_sheet_df(ws_hotels, df_hotels, HOTEL_COLS)
+                                save_sheet_df("住宿飯店", df_hotels, HOTEL_COLS)
                                 st.success("✅ 飯店資訊已更新！")
                                 st.rerun()
 
@@ -2469,7 +2528,7 @@ if st.session_state["workspace_area"] == "shared":
                             "更新時間": get_tw_now_str()
                         }])
                         df_notes = pd.concat([df_notes, new_note_row], ignore_index=True)
-                        save_sheet_df(ws_notes, df_notes, NOTE_COLS)
+                        save_sheet_df("共用筆記", df_notes, NOTE_COLS)
                         st.success(f"✅ 已發布筆記「{n_title.strip()}」！")
                         st.rerun()
 
@@ -2496,7 +2555,6 @@ if st.session_state["workspace_area"] == "shared":
                 )
                 df_notes_disp = df_notes_disp[mask_kw]
 
-            # 置頂的筆記排在最前面，其餘依最新更新時間排序
             df_notes_disp = df_notes_disp.sort_values(by=["_is_pinned", "更新時間"], ascending=[False, False])
 
             if df_notes_disp.empty:
@@ -2549,13 +2607,13 @@ if st.session_state["workspace_area"] == "shared":
                                         df_notes.at[orig_n_idx, "相關連結"] = ed_n_link.strip()
                                         df_notes.at[orig_n_idx, "作者"] = current_user
                                         df_notes.at[orig_n_idx, "更新時間"] = get_tw_now_str()
-                                        save_sheet_df(ws_notes, df_notes, NOTE_COLS)
+                                        save_sheet_df("共用筆記", df_notes, NOTE_COLS)
                                         st.success("✅ 筆記已更新！")
                                         st.rerun()
 
                                 if del_n_btn:
                                     df_notes = df_notes.drop(orig_n_idx).reset_index(drop=True)
-                                    save_sheet_df(ws_notes, df_notes, NOTE_COLS)
+                                    save_sheet_df("共用筆記", df_notes, NOTE_COLS)
                                     st.success("✅ 已刪除此則筆記！")
                                     st.rerun()
 
@@ -2704,14 +2762,12 @@ if st.session_state["workspace_area"] == "shared":
                 fetch_live_jpy_to_twd.clear()
                 st.rerun()
 
-        ws_users = get_or_create_ws("使用者帳號", USER_COLS)
-        df_users = load_sheet_df(ws_users, USER_COLS)
+        df_users = load_sheet_df("使用者帳號", USER_COLS)
         registered_members = [u.strip() for u in df_users["暱稱"].tolist() if u.strip()]
         if current_user not in registered_members:
             registered_members.append(current_user)
 
-        ws_exp = get_or_create_ws("共同支出", EXPENSE_COLS)
-        df_exp = load_sheet_df(ws_exp, EXPENSE_COLS)
+        df_exp = load_sheet_df("共同支出", EXPENSE_COLS)
 
         with st.container(border=True):
             st.markdown("**➕ 新增一筆共同支出 / 代墊款項**")
@@ -2758,7 +2814,7 @@ if st.session_state["workspace_area"] == "shared":
                             "記錄者": current_user
                         }])
                         df_exp = pd.concat([df_exp, new_exp], ignore_index=True)
-                        save_sheet_df(ws_exp, df_exp, EXPENSE_COLS)
+                        save_sheet_df("共同支出", df_exp, EXPENSE_COLS)
                         st.success(f"✅ 已新增支出：{exp_title.strip()}（{curr_code} {int(exp_amt):,}）")
                         st.rerun()
 
@@ -2787,7 +2843,7 @@ if st.session_state["workspace_area"] == "shared":
                 if st.button("確認刪除此筆帳目", type="secondary"):
                     del_i = int(sel_del_exp.split("]")[0].replace("[", ""))
                     df_exp = df_exp.drop(del_i).reset_index(drop=True)
-                    save_sheet_df(ws_exp, df_exp, EXPENSE_COLS)
+                    save_sheet_df("共同支出", df_exp, EXPENSE_COLS)
                     st.success("✅ 已刪除該筆帳目！")
                     st.rerun()
 
@@ -2885,8 +2941,7 @@ else:
     ])
 
     with ptab1:
-        ws_shop = get_or_create_ws("私人購物清單", SHOPPING_COLS)
-        df_shop_all = load_sheet_df(ws_shop, SHOPPING_COLS)
+        df_shop_all = load_sheet_df("私人購物清單", SHOPPING_COLS)
         my_shop = df_shop_all[df_shop_all["擁有者"].str.strip() == current_user].copy()
 
         live_rate, rate_status, _ = fetch_live_jpy_to_twd()
@@ -2960,7 +3015,7 @@ else:
                             "備註": s_note.strip()
                         }])
                         df_shop_all = pd.concat([df_shop_all, new_s], ignore_index=True)
-                        save_sheet_df(ws_shop, df_shop_all, SHOPPING_COLS)
+                        save_sheet_df("私人購物清單", df_shop_all, SHOPPING_COLS)
                         st.success(f"✅ 已加入「{s_item.strip()}」！")
                         st.rerun()
 
@@ -2992,13 +3047,12 @@ else:
                 saved_my_shop["日幣金額"] = saved_my_shop["日幣金額"].fillna(0).astype(int).astype(str)
 
                 merged_shop = pd.concat([others_shop, saved_my_shop], ignore_index=True)
-                save_sheet_df(ws_shop, merged_shop, SHOPPING_COLS)
+                save_sheet_df("私人購物清單", merged_shop, SHOPPING_COLS)
                 st.success("✅ 私人購物清單已同步儲存！")
                 st.rerun()
 
     with ptab2:
-        ws_pack = get_or_create_ws("個人行李清單", PACKING_COLS)
-        df_pack_all = load_sheet_df(ws_pack, PACKING_COLS)
+        df_pack_all = load_sheet_df("個人行李清單", PACKING_COLS)
         my_pack = df_pack_all[df_pack_all["擁有者"].str.strip() == current_user].copy()
 
         if my_pack.empty:
@@ -3015,7 +3069,7 @@ else:
                     for cat, item_n, qty in DEFAULT_PACKING_TEMPLATE
                 ]
                 df_pack_all = pd.concat([df_pack_all, pd.DataFrame(tpl_rows)], ignore_index=True)
-                save_sheet_df(ws_pack, df_pack_all, PACKING_COLS)
+                save_sheet_df("個人行李清單", df_pack_all, PACKING_COLS)
                 st.success("🎉 已匯入 10 項日本旅遊必備物品！")
                 st.rerun()
         else:
@@ -3047,7 +3101,7 @@ else:
                             "已打包": "FALSE"
                         }])
                         df_pack_all = pd.concat([df_pack_all, new_p], ignore_index=True)
-                        save_sheet_df(ws_pack, df_pack_all, PACKING_COLS)
+                        save_sheet_df("個人行李清單", df_pack_all, PACKING_COLS)
                         st.success(f"✅ 已加入「{p_name.strip()}」！")
                         st.rerun()
 
@@ -3074,6 +3128,6 @@ else:
                 saved_my_pack["已打包"] = saved_my_pack["已打包"].apply(lambda b: "TRUE" if b else "FALSE")
 
                 merged_pack = pd.concat([others_pack, saved_my_pack], ignore_index=True)
-                save_sheet_df(ws_pack, merged_pack, PACKING_COLS)
+                save_sheet_df("個人行李清單", merged_pack, PACKING_COLS)
                 st.success("✅ 個人行李清單已同步儲存！")
                 st.rerun()
