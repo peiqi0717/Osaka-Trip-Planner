@@ -60,25 +60,25 @@ SHARED_TAB_KEYS = [
 ]
 
 SHARED_TAB_LABELS = {
-    "itin": "📅 每日行程排程 ＆ AI 顧問",
+    "itin": "📅 每日行程 ＆ AI 顧問",
     "flight_hotel": "✈️ 機票 ＆ 住宿整理",
     "map": "🗺️ 互動地圖總覽",
     "list": "📋 共用旅遊清單",
-    "route": "🧭 路線與距離試算",
-    "notes": "📝 共用筆記 ＆ 重點整理",
+    "route": "🧭 路線距離試算",
+    "notes": "📝 共用筆記整理",
     "add": "➕ 新增連結",
     "edit": "✏️ 修改 / 刪除",
-    "expense": "💰 共同支出＆分帳計算機",
-    "excel": "📊 匯出精美 Excel"
+    "expense": "💰 共同支出＆分帳",
+    "excel": "📊 匯出 Excel"
 }
 
 CAT_COLOR_RGBA = {
-    "美食": [255, 87, 51, 235],         # 橘紅色
-    "購物": [155, 89, 182, 235],        # 亮紫色
-    "景點與地標": [39, 174, 96, 235],   # 翠綠色
-    "交通/住宿": [41, 128, 185, 235],   # 寶藍色
-    "住宿飯店": [241, 196, 15, 245],    # 金黃色
-    "未分類": [127, 140, 141, 235]      # 鐵灰色
+    "美食": [255, 87, 51, 235],
+    "購物": [155, 89, 182, 235],
+    "景點與地標": [39, 174, 96, 235],
+    "交通/住宿": [41, 128, 185, 235],
+    "住宿飯店": [241, 196, 15, 245],
+    "未分類": [127, 140, 141, 235]
 }
 
 PIN_SVG = """
@@ -131,7 +131,7 @@ BRANCH_INDICATORS = [
 ]
 
 # ==========================================
-# 自動智慧分區判定引擎（座標圍欄 ＋ 車站與關鍵字）
+# 自動智慧分區判定引擎
 # ==========================================
 def classify_kansai_region(lat=None, lon=None, name="", station_text="", note=""):
     combined_text = f"{name} {station_text} {note}"
@@ -223,15 +223,15 @@ def build_map_marker_layer(df_points, marker_style, is_day_route=False):
         )
 
 # ==========================================
-# 2. 即時日幣匯率抓取工具（每 30 分鐘自動更新）
+# 2. 即時日幣匯率抓取工具（每 60 分鐘自動更新）
 # ==========================================
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_live_jpy_to_twd():
     tw_tz = timezone(timedelta(hours=8))
     now_str = datetime.datetime.now(tw_tz).strftime("%H:%M")
 
     try:
-        res = requests.get("https://open.er-api.com/v6/latest/JPY", timeout=4)
+        res = requests.get("https://open.er-api.com/v6/latest/JPY", timeout=3)
         data = res.json()
         if data.get("result") == "success":
             twd_rate = float(data["rates"]["TWD"])
@@ -243,7 +243,7 @@ def fetch_live_jpy_to_twd():
     try:
         res = requests.get(
             "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/jpy.json",
-            timeout=4
+            timeout=3
         )
         data = res.json()
         twd_rate = float(data["jpy"]["twd"])
@@ -255,7 +255,7 @@ def fetch_live_jpy_to_twd():
     return 0.2150, "⚠️ 離線預設參考匯率（可手動調整）", False
 
 # ==========================================
-# 3. 連接 Google 試算表 (含防限流快取與自動重試保護)
+# 3. 連接 Google 試算表 (含長效快取與自動重試保護)
 # ==========================================
 @st.cache_resource
 def get_spreadsheet():
@@ -269,7 +269,6 @@ def get_spreadsheet():
     return client.open_by_url(st.secrets["sheet_url"])
 
 def _retry_gspread(func, *args, **kwargs):
-    """遇到 Google API 暫時性限流 (429) 時自動稍候重試，避免畫面跳紅字"""
     for attempt in range(4):
         try:
             return func(*args, **kwargs)
@@ -290,7 +289,7 @@ def get_or_create_ws(title, default_cols):
         return ws
     return _retry_gspread(_op)
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=180, show_spinner=False)
 def _cached_read_sheet(sheet_key, default_cols_tuple, defaults_items_tuple):
     default_cols = list(default_cols_tuple)
     defaults_map = dict(defaults_items_tuple)
@@ -385,7 +384,6 @@ def save_trip_dates(start_date, end_date):
     save_sheet_df(ws_meta, df_meta, META_COLS)
 
 def load_user_tab_order(username):
-    """讀取該使用者自訂的共用區分頁順序（自動相容舊版 hotel 鍵值）"""
     df_meta = load_sheet_df("旅遊設定", META_COLS)
     meta_dict = dict(zip(df_meta["設定鍵"], df_meta["設定值"]))
     raw_order = meta_dict.get(f"tab_order_{username}", "")
@@ -402,7 +400,6 @@ def load_user_tab_order(username):
     return list(SHARED_TAB_KEYS)
 
 def save_user_tab_order(username, ordered_keys):
-    """儲存該使用者自訂的共用區分頁順序"""
     ws_meta = get_or_create_ws("旅遊設定", META_COLS)
     df_meta = load_sheet_df("旅遊設定", META_COLS)
     key_name = f"tab_order_{username}"
@@ -680,7 +677,7 @@ def resolve_google_maps_url(url):
         raw_decoded = urllib.parse.unquote(url)
         lat, lon = extract_coords_from_text(raw_decoded)
 
-        res = requests.get(url, headers=headers, cookies=cookies, timeout=6, allow_redirects=True)
+        res = requests.get(url, headers=headers, cookies=cookies, timeout=4, allow_redirects=True)
         candidate_urls = [r.url for r in res.history] + [res.url]
         for u in candidate_urls:
             decoded_u = urllib.parse.unquote(u)
@@ -718,7 +715,7 @@ def scrape_webpage_title_and_coords(url):
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         }
-        res = requests.get(url, headers=headers, timeout=4, allow_redirects=True)
+        res = requests.get(url, headers=headers, timeout=3, allow_redirects=True)
         soup = BeautifulSoup(res.text, 'html.parser')
         if soup.title and soup.title.string and soup.title.string.strip():
             t = soup.title.string.strip()
@@ -776,7 +773,7 @@ def query_google_places_new(place_name, region="", note=""):
                 "languageCode": "zh-TW",
                 "regionCode": "JP"
             },
-            timeout=6
+            timeout=3.5
         )
         data = res.json()
         if "error" in data:
@@ -823,7 +820,7 @@ def get_station_details(lat, lon):
         res = requests.get(
             "https://express.heartrails.com/api/json",
             params={"method": "getStations", "x": lon, "y": lat},
-            timeout=5
+            timeout=3
         )
         stations = res.json().get("response", {}).get("station", [])
         if not stations:
@@ -994,7 +991,7 @@ def build_route_comparison_row(orig_obj, dest_obj):
     }
 
 # ==========================================
-# 6. 產生美化 Excel 報表（含機票航班、住宿飯店、每日行程與筆記分頁）
+# 6. 產生美化 Excel 報表
 # ==========================================
 def generate_styled_excel(df_links, df_itin=None, df_hotels=None, df_flights=None, df_notes=None):
     all_list = []
@@ -1288,7 +1285,7 @@ if st.session_state["workspace_area"] is None:
     with card_col1:
         with st.container(border=True):
             st.subheader("🌍 大家共用區（團隊協作）")
-            st.write("所有同行夥伴共同編輯與查詢的旅遊大本營（可自訂分頁排列順序）：")
+            st.write("所有同行夥伴共同編輯與查詢的旅遊大本營（可自訂功能排列順序）：")
             st.markdown("""
             * 📅 **每日行程排程器 ＆ AI 顧問**：日曆排程、相鄰景點距離自動提示、AI 路線健檢
             * ✈️ **機票 ＆ 住宿整理**：並排憑證看板，整合去回程航班、航廈、訂位代號與住宿資訊
@@ -1354,41 +1351,39 @@ with nav_c4:
 st.divider()
 
 # ==============================================================================
-# 區塊 A：🌍 大家共用區
+# 區塊 A：🌍 大家共用區（單頁按需載入架構，手機與電腦切換極速順暢）
 # ==============================================================================
 if st.session_state["workspace_area"] == "shared":
     df_links = load_data()
     df_flights = load_sheet_df("機票航班", FLIGHT_COLS)
     df_hotels = load_sheet_df("住宿飯店", HOTEL_COLS)
-    df_notes = load_sheet_df("共用筆記", NOTE_COLS)
 
     has_gmap_key = bool(st.secrets.get("google_maps_api_key", "").strip())
     key_badge = "✅ Google 地圖 API 已連線" if has_gmap_key else "⚠️ 尚未偵測到 Google 地圖 API 金鑰"
-    st.caption(f"📊 共收錄 **{len(df_links)}** 筆景點 ｜ ✈️ **{len(df_flights)}** 筆航班 ｜ 🏨 **{len(df_hotels)}** 間飯店 ｜ 📝 **{len(df_notes)}** 則筆記 ｜ {key_badge} ｜ [📄 開啟 Google 試算表]({st.secrets['sheet_url']})")
+    st.caption(f"📊 共收錄 **{len(df_links)}** 筆景點 ｜ ✈️ **{len(df_flights)}** 筆航班 ｜ 🏨 **{len(df_hotels)}** 間飯店 ｜ {key_badge} ｜ [📄 開啟 Google 試算表]({st.secrets['sheet_url']})")
 
-    # 讀取當前使用者專屬的分頁排列順序
     user_tab_keys = load_user_tab_order(current_user)
 
-    with st.expander("⚙️ 自訂共用區分頁順序（修改數字 1～10 即可把重要的分頁排到最前面）"):
-        st.caption("💡 直接點擊「顯示順序」欄位修改數字（數字越小越靠左），調整完畢後按下方 **「💾 套用並儲存我的排序」** 即可（設定僅影響你的帳號視角）：")
+    with st.expander("⚙️ 自訂共用區功能排序（修改數字 1～10 即可把重要的功能排到最前面）"):
+        st.caption("💡 直接點擊「顯示順序」欄位修改數字（數字越小越靠前），調整完畢後按下方 **「💾 套用並儲存我的排序」** 即可（設定僅影響你的帳號視角）：")
 
         order_df = pd.DataFrame([
             {
                 "顯示順序": idx + 1,
-                "分頁名稱": SHARED_TAB_LABELS[k],
+                "功能名稱": SHARED_TAB_LABELS[k],
                 "_key": k
             }
             for idx, k in enumerate(user_tab_keys)
         ])
 
         edited_order_df = st.data_editor(
-            order_df[["顯示順序", "分頁名稱"]],
+            order_df[["顯示順序", "功能名稱"]],
             use_container_width=True,
             hide_index=True,
-            disabled=["分頁名稱"],
+            disabled=["功能名稱"],
             column_config={
                 "顯示順序": st.column_config.NumberColumn(
-                    "顯示順序（1 = 最左邊）",
+                    "顯示順序（1 = 最前面）",
                     min_value=1,
                     max_value=len(SHARED_TAB_KEYS),
                     step=1,
@@ -1406,7 +1401,7 @@ if st.session_state["workspace_area"] == "shared":
                 merged_ord = merged_ord.sort_values(by=["顯示順序"], kind="stable")
                 new_keys = merged_ord["_key"].tolist()
                 save_user_tab_order(current_user, new_keys)
-                st.success("✅ 已儲存你的專屬分頁順序！")
+                st.success("✅ 已儲存你的專屬功能順序！")
                 st.rerun()
         with ord_c2:
             if st.button("↩️ 恢復系統預設順序", use_container_width=True):
@@ -1414,16 +1409,27 @@ if st.session_state["workspace_area"] == "shared":
                 st.success("✅ 已恢復預設順序！")
                 st.rerun()
 
-    # 動態產生使用者自訂順序的 Tabs 並對應回各功能區塊
-    ordered_tab_titles = [SHARED_TAB_LABELS[k] for k in user_tab_keys]
-    created_tabs = st.tabs(ordered_tab_titles)
-    tab_map = dict(zip(user_tab_keys, created_tabs))
+    # 改用單頁即時切換選單（只執行當前選擇的頁面，避免手機背景同時載入 10 頁卡死）
+    with st.container(border=True):
+        active_page = st.radio(
+            "🧭 選擇要開啟的功能頁面：",
+            options=user_tab_keys,
+            format_func=lambda k: SHARED_TAB_LABELS[k],
+            horizontal=True,
+            key="shared_active_page_nav"
+        )
 
-    saved_start, saved_end = load_trip_dates()
-    df_itin = load_sheet_df("每日行程", ITINERARY_COLS)
+    # 按需載入旅程日期與行程資料
+    saved_start, saved_end = (None, None)
+    df_itin = pd.DataFrame(columns=ITINERARY_COLS)
+    if active_page in ["itin", "flight_hotel", "map", "excel"]:
+        saved_start, saved_end = load_trip_dates()
+        df_itin = load_sheet_df("每日行程", ITINERARY_COLS)
 
-    # --- 分頁：📅 每日行程排程器 ＆ AI 旅遊顧問 ---
-    with tab_map["itin"]:
+    # ==========================================================
+    # 頁面：📅 每日行程排程器 ＆ AI 旅遊顧問
+    # ==========================================================
+    if active_page == "itin":
         st.subheader("📅 直覺式每日行程排程器 ＆ 🤖 AI 路線顧問")
 
         with st.container(border=True):
@@ -1681,10 +1687,14 @@ if st.session_state["workspace_area"] == "shared":
                         group_items = list(group.iterrows())
                         resolved_coords_list = []
                         for _, r_item in group_items:
-                            s_n = str(r_item["行程名稱"]).replace("🏨 飯店退房：", "").replace("🔑 飯店入住：", "").strip()
-                            u_str, reg_str, note_str = link_meta_map.get(s_n, (str(r_item["網址"]).strip(), "", ""))
-                            _, _, lat_v, lon_v, _, st_lines_v = resolve_place_full(url=u_str, custom_name=s_n, region=reg_str, note=note_str)
-                            resolved_coords_list.append((lat_v, lon_v, st_lines_v))
+                            is_manual_custom = (str(r_item["最近車站"]).strip() == "-" and not str(r_item["網址"]).strip())
+                            if is_manual_custom:
+                                resolved_coords_list.append((None, None, []))
+                            else:
+                                s_n = str(r_item["行程名稱"]).replace("🏨 飯店退房：", "").replace("🔑 飯店入住：", "").strip()
+                                u_str, reg_str, note_str = link_meta_map.get(s_n, (str(r_item["網址"]).strip(), "", ""))
+                                _, _, lat_v, lon_v, _, st_lines_v = resolve_place_full(url=u_str, custom_name=s_n, region=reg_str, note=note_str)
+                                resolved_coords_list.append((lat_v, lon_v, st_lines_v))
 
                         for pos_i, (orig_idx, row) in enumerate(group_items):
                             with st.container(border=True):
@@ -1823,17 +1833,16 @@ if st.session_state["workspace_area"] == "shared":
                         st.markdown("### 💡 AI 顧問分析報告")
                         st.markdown(ai_reply)
 
-    # --- 分頁：✈️ 機票 ＆ 住宿整理 ---
-    with tab_map["flight_hotel"]:
+    # ==========================================================
+    # 頁面：✈️ 機票 ＆ 住宿整理
+    # ==========================================================
+    elif active_page == "flight_hotel":
         st.subheader("✈️ 機票 ＆ 住宿確定資訊總覽")
         st.caption("把整趟旅程確定的機票航班、航廈、訂位代號與住宿飯店並排整理在這裡，出國查憑證一眼看完，並自動連動到每日行程表與地圖！")
 
         default_ci_date = saved_start if saved_start else datetime.date.today() + timedelta(days=14)
         default_co_date = saved_end if saved_end else default_ci_date + timedelta(days=4)
 
-        # ==========================================
-        # 上半部：並排檢視卡片（左：機票航班 ｜ 右：住宿飯店）
-        # ==========================================
         view_fl_col, view_ht_col = st.columns(2)
 
         with view_fl_col:
@@ -1904,9 +1913,6 @@ if st.session_state["workspace_area"] == "shared":
 
         st.divider()
 
-        # ==========================================
-        # 下半部：收合式新增與編輯管理區（不干擾檢視清爽度）
-        # ==========================================
         add_fl_col, add_ht_col = st.columns(2)
 
         with add_fl_col:
@@ -2161,8 +2167,10 @@ if st.session_state["workspace_area"] == "shared":
                             st.success("✅ 已刪除此間飯店！")
                             st.rerun()
 
-    # --- 分頁：🗺️ 互動地圖總覽 ---
-    with tab_map["map"]:
+    # ==========================================================
+    # 頁面：🗺️ 互動地圖總覽
+    # ==========================================================
+    elif active_page == "map":
         st.subheader("🗺️ 全景點 ＆ 每日動線互動地圖總覽")
         st.caption("🟡 住宿飯店 ｜ 🔴 美食 ｜ 🟣 購物 ｜ 🟢 景點與地標 ｜ 🔵 交通/住宿（滑鼠移到標記上或手機點擊可查看店名與車站資訊）")
 
@@ -2369,8 +2377,10 @@ if st.session_state["workspace_area"] == "shared":
                         st.dataframe(pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
                         st.caption(f"🏁 {chosen_map_day} 全日累計直線移動距離：約 **{total_km:.2f} km**")
 
-    # --- 分頁：📋 共用旅遊清單 ---
-    with tab_map["list"]:
+    # ==========================================================
+    # 頁面：📋 共用旅遊清單
+    # ==========================================================
+    elif active_page == "list":
         if df_links.empty:
             st.info("目前清單空空如也，快切換到「➕ 新增連結」加入第一個大阪景點吧！")
         else:
@@ -2488,8 +2498,10 @@ if st.session_state["workspace_area"] == "shared":
                 }
             )
 
-    # --- 分頁：🧭 路線與距離試算 ---
-    with tab_map["route"]:
+    # ==========================================================
+    # 頁面：🧭 路線與距離試算
+    # ==========================================================
+    elif active_page == "route":
         st.subheader("🧭 路線距離與電車轉乘試算")
         calc_mode = st.radio(
             "請選擇試算模式：",
@@ -2713,8 +2725,11 @@ if st.session_state["workspace_area"] == "shared":
                             }
                         )
 
-    # --- 分頁：📝 共用筆記 ＆ 重點整理 ---
-    with tab_map["notes"]:
+    # ==========================================================
+    # 頁面：📝 共用筆記 ＆ 重點整理
+    # ==========================================================
+    elif active_page == "notes":
+        df_notes = load_sheet_df("共用筆記", NOTE_COLS)
         st.subheader("📝 共用筆記 ＆ 重點整理牆")
         st.caption("把全團需要一起看的攻略重點、必看 YouTube 影片、交通票券提醒或行前備忘整理在這裡，條理分明不洗版！")
 
@@ -2842,8 +2857,10 @@ if st.session_state["workspace_area"] == "shared":
                                     st.success("✅ 已刪除此則筆記！")
                                     st.rerun()
 
-    # --- 分頁：➕ 新增連結 ---
-    with tab_map["add"]:
+    # ==========================================================
+    # 頁面：➕ 新增連結
+    # ==========================================================
+    elif active_page == "add":
         with st.form("add_link_form", clear_on_submit=True):
             st.subheader("新增景點 / 餐廳 / 購物連結")
             st.caption("✨ 貼上網址或輸入店名後，系統會透過 Google API 自動定位座標、反查最近車站，並**自動判斷所屬商圈分區**！")
@@ -2907,8 +2924,10 @@ if st.session_state["workspace_area"] == "shared":
                             st.success(f"✅ 新增成功！「{fetched_title}」｜自動分區：【{auto_region}】｜{subway_result}")
                             st.rerun()
 
-    # --- 分頁：✏️ 修改 / 刪除 ---
-    with tab_map["edit"]:
+    # ==========================================================
+    # 頁面：✏️ 修改 / 刪除
+    # ==========================================================
+    elif active_page == "edit":
         if df_links.empty:
             st.info("目前清單沒有任何資料可以修改或刪除。")
         else:
@@ -2974,8 +2993,10 @@ if st.session_state["workspace_area"] == "shared":
                 st.success("✅ 已成功刪除該筆連結！")
                 st.rerun()
 
-    # --- 分頁：💰 共同支出記帳＆自動分帳計算機 ---
-    with tab_map["expense"]:
+    # ==========================================================
+    # 頁面：💰 共同支出記帳＆自動分帳計算機
+    # ==========================================================
+    elif active_page == "expense":
         st.subheader("💰 共同支出記帳區 ＆ 自動分帳計算機")
         live_rate, rate_status, _ = fetch_live_jpy_to_twd()
 
@@ -3132,8 +3153,11 @@ if st.session_state["workspace_area"] == "shared":
                             for debtor, creditor, amt in twd_transfers:
                                 st.warning(f"💸 **{debtor}** ➔ 轉給 **{creditor}**：**NT$ {amt:,} TWD**")
 
-    # --- 分頁：📊 匯出精美 Excel ---
-    with tab_map["excel"]:
+    # ==========================================================
+    # 頁面：📊 匯出精美 Excel
+    # ==========================================================
+    elif active_page == "excel":
+        df_notes = load_sheet_df("共用筆記", NOTE_COLS)
         st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、智慧判定商圈分區並依區域上色分類，產生包含「機票航班表」、「住宿飯店表」、「每日行程表」、「共用筆記整理」、「總表」與各分類分頁的 Excel 檔案。")
         if df_links.empty and df_itin.empty and df_hotels.empty and df_flights.empty and df_notes.empty:
             st.info("目前沒有資料可以匯出喔！")
@@ -3160,12 +3184,14 @@ else:
     st.title(f"🔒 {current_user} 的私人專屬空間")
     st.caption("這裡的所有清單都只綁定你的個人帳號，其他夥伴登入後不會看到喔！")
 
-    ptab1, ptab2 = st.tabs([
-        "🛍️ 私人購物 ＆ 代購清單",
-        "🧳 個人行李打包清單"
-    ])
+    priv_page = st.radio(
+        "選擇私人功能：",
+        ["🛍️ 私人購物 ＆ 代購清單", "🧳 個人行李打包清單"],
+        horizontal=True,
+        key="private_active_page_nav"
+    )
 
-    with ptab1:
+    if priv_page.startswith("🛍️"):
         df_shop_all = load_sheet_df("私人購物清單", SHOPPING_COLS)
         my_shop = df_shop_all[df_shop_all["擁有者"].str.strip() == current_user].copy()
 
@@ -3276,7 +3302,7 @@ else:
                 st.success("✅ 私人購物清單已同步儲存！")
                 st.rerun()
 
-    with ptab2:
+    else:
         df_pack_all = load_sheet_df("個人行李清單", PACKING_COLS)
         my_pack = df_pack_all[df_pack_all["擁有者"].str.strip() == current_user].copy()
 
