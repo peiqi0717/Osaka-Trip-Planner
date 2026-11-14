@@ -33,13 +33,41 @@ SHOPPING_COLS = ["擁有者", "商品名稱", "分類", "購買地點", "日幣�
 PACKING_COLS = ["擁有者", "分類", "物品名稱", "數量", "已打包"]
 ITINERARY_COLS = ["天數", "日期", "時間", "行程名稱", "分類", "最近車站", "網址", "備註", "排程者"]
 HOTEL_COLS = ["飯店名稱", "網址", "入住日期", "入住時間", "退房日期", "退房時間", "最近車站", "訂房備註", "新增者"]
+NOTE_COLS = ["置頂", "標籤", "標題", "內文", "相關連結", "作者", "更新時間"]
 META_COLS = ["設定鍵", "設定值"]
 
 CAT_OPTIONS = ["美食", "購物", "景點與地標", "交通/住宿", "未分類"]
 REGION_OPTIONS = ["難波/心齋橋", "梅田", "天王寺/阿倍野", "環球影城/港區", "京都/神戶/奈良", "其他/未指定"]
 SHOP_CAT_OPTIONS = ["藥妝美妝", "伴手禮/零食", "服飾/精品", "動漫/雜貨", "親友代購", "其他"]
 PACK_CAT_OPTIONS = ["重要證件/錢包", "3C電子/網路", "衣物穿搭", "盥洗/常備藥品", "隨身小物", "其他"]
+NOTE_TAG_OPTIONS = ["📌 行前攻略", "🚃 交通票券", "🎬 必看影片", "🍜 美食筆記", "🛍️ 購物退稅", "⚠️ 注意事項", "📝 其他筆記"]
 WEEKDAY_ZH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+
+SHARED_TAB_KEYS = [
+    "itin",
+    "hotel",
+    "map",
+    "list",
+    "route",
+    "notes",
+    "add",
+    "edit",
+    "expense",
+    "excel"
+]
+
+SHARED_TAB_LABELS = {
+    "itin": "📅 每日行程排程 ＆ AI 顧問",
+    "hotel": "🏨 住宿飯店管理",
+    "map": "🗺️ 互動地圖總覽",
+    "list": "📋 共用旅遊清單",
+    "route": "🧭 路線與距離試算",
+    "notes": "📝 共用筆記 ＆ 重點整理",
+    "add": "➕ 新增連結",
+    "edit": "✏️ 修改 / 刪除",
+    "expense": "💰 共同支出＆分帳計算機",
+    "excel": "📊 匯出精美 Excel"
+}
 
 CAT_COLOR_RGBA = {
     "美食": [255, 87, 51, 235],         # 橘紅色
@@ -105,35 +133,22 @@ BRANCH_INDICATORS = [
 def classify_kansai_region(lat=None, lon=None, name="", station_text="", note=""):
     combined_text = f"{name} {station_text} {note}"
 
-    # 1. 優先使用精準經緯度地理圍欄判定
     if lat is not None and lon is not None:
-        # 京都府（緯度高於 34.85）
         if lat >= 34.85:
             return "京都/神戶/奈良"
-        # 神戶 / 兵庫方向（經度低於 135.33）
         if lon <= 135.33:
             return "京都/神戶/奈良"
-        # 奈良方向（經度高於 135.68）
         if lon >= 135.68:
             return "京都/神戶/奈良"
-
-        # 環球影城 / 天保山 / 港區 / 夢洲舞洲（大阪灣沿岸）
         if (34.630 <= lat <= 34.685) and (135.380 <= lon <= 135.468):
             return "環球影城/港區"
-
-        # 梅田 / 大阪站 / 北新地 / 中崎町 / 福島 / 中之島北側
         if (34.691 <= lat <= 34.718) and (135.475 <= lon <= 135.522):
             return "梅田"
-
-        # 難波 / 心齋橋 / 道頓堀 / 日本橋 / 黑門 / 堀江 / 美國村 / 四橋 / 長堀橋 / 堺筋本町南側
         if (34.656 <= lat <= 34.684) and (135.485 <= lon <= 135.516):
             return "難波/心齋橋"
-
-        # 天王寺 / 阿倍野 / 新世界 / 通天閣 / 動物園前 / 恵美須町
         if (34.638 <= lat <= 34.658) and (135.495 <= lon <= 135.528):
             return "天王寺/阿倍野"
 
-    # 2. 次優先：根據最近車站名稱與店名/備註關鍵字判定
     kyoto_kobe_nara_kw = [
         "京都", "嵐山", "伏見", "宇治", "祇園", "河原町", "清水寺", "金閣寺", "錦市場",
         "神戶", "神戸", "三宮", "元町", "有馬", "姬路", "姫路", "明石", "淡路",
@@ -313,10 +328,37 @@ def load_trip_dates():
 
 def save_trip_dates(start_date, end_date):
     ws_meta = get_or_create_ws("旅遊設定", META_COLS)
-    df_meta = pd.DataFrame([
+    df_meta = load_sheet_df(ws_meta, META_COLS)
+    df_meta = df_meta[~df_meta["設定鍵"].isin(["start_date", "end_date"])].copy()
+    new_rows = pd.DataFrame([
         {"設定鍵": "start_date", "設定值": start_date.isoformat()},
         {"設定鍵": "end_date", "設定值": end_date.isoformat()}
     ])
+    df_meta = pd.concat([df_meta, new_rows], ignore_index=True)
+    save_sheet_df(ws_meta, df_meta, META_COLS)
+
+def load_user_tab_order(username):
+    """讀取該使用者自訂的共用區分頁順序"""
+    ws_meta = get_or_create_ws("旅遊設定", META_COLS)
+    df_meta = load_sheet_df(ws_meta, META_COLS)
+    meta_dict = dict(zip(df_meta["設定鍵"], df_meta["設定值"]))
+    raw_order = meta_dict.get(f"tab_order_{username}", "")
+    if raw_order:
+        saved_keys = [k.strip() for k in raw_order.split(",") if k.strip() in SHARED_TAB_KEYS]
+        for k in SHARED_TAB_KEYS:
+            if k not in saved_keys:
+                saved_keys.append(k)
+        return saved_keys
+    return list(SHARED_TAB_KEYS)
+
+def save_user_tab_order(username, ordered_keys):
+    """儲存該使用者自訂的共用區分頁順序"""
+    ws_meta = get_or_create_ws("旅遊設定", META_COLS)
+    df_meta = load_sheet_df(ws_meta, META_COLS)
+    key_name = f"tab_order_{username}"
+    df_meta = df_meta[df_meta["設定鍵"] != key_name].copy()
+    new_row = pd.DataFrame([{"設定鍵": key_name, "設定值": ",".join(ordered_keys)}])
+    df_meta = pd.concat([df_meta, new_row], ignore_index=True)
     save_sheet_df(ws_meta, df_meta, META_COLS)
 
 def get_hotel_events_for_date(df_hotels, target_date):
@@ -813,7 +855,6 @@ def resolve_place_and_subway(url, custom_name="", region="", note=""):
     return title, subway_info
 
 def resolve_place_subway_and_region(url, custom_name="", note=""):
-    """一次解析地點標題、最近車站與自動智慧分區"""
     title, subway_info, lat, lon, _, _ = resolve_place_full(url, custom_name, "", note)
     auto_reg = classify_kansai_region(lat=lat, lon=lon, name=title, station_text=subway_info, note=note)
     return title, subway_info, auto_reg
@@ -879,9 +920,9 @@ def build_route_comparison_row(orig_obj, dest_obj):
     }
 
 # ==========================================
-# 6. 產生美化 Excel 報表（含每日行程表與住宿飯店分頁）
+# 6. 產生美化 Excel 報表（含每日行程表、住宿飯店與共用筆記分頁）
 # ==========================================
-def generate_styled_excel(df_links, df_itin=None, df_hotels=None):
+def generate_styled_excel(df_links, df_itin=None, df_hotels=None, df_notes=None):
     all_list = []
     food_list, shop_list, spot_list, other_list = [], [], [], []
     sheet_updated = False
@@ -1003,6 +1044,11 @@ def generate_styled_excel(df_links, df_itin=None, df_hotels=None):
             df_itin_sorted.to_excel(writer, sheet_name="📅 每日行程表", index=False)
             sheets_written.append("📅 每日行程表")
 
+        if df_notes is not None and not df_notes.empty:
+            df_notes_clean = df_notes[["標籤", "標題", "內文", "相關連結", "作者", "更新時間"]].copy()
+            df_notes_clean.to_excel(writer, sheet_name="📝 共用筆記整理", index=False)
+            sheets_written.append("📝 共用筆記整理")
+
         sheet_map = [
             (df_all, "📋 總表"),
             (df_food, "🍔 美食指南"),
@@ -1027,7 +1073,7 @@ def generate_styled_excel(df_links, df_itin=None, df_hotels=None):
                 col_name = ws.cell(row=1, column=col).value
                 if col_name == "區域/商圈":
                     region_col_idx = col
-                if col_name in ["網址", "Google地圖導航"]:
+                if col_name in ["網址", "Google地圖導航", "相關連結"]:
                     url_cols.append((col, col_name))
 
             header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
@@ -1056,7 +1102,7 @@ def generate_styled_excel(df_links, df_itin=None, df_hotels=None):
                 for c_idx, col_name in url_cols:
                     orig_url = ws.cell(row=r, column=c_idx).value
                     if orig_url and str(orig_url).startswith("http"):
-                        disp_text = "🔗 原始連結" if col_name == "網址" else "📍 開啟地圖"
+                        disp_text = "📍 開啟地圖" if col_name == "Google地圖導航" else "🔗 原始連結"
                         ws.cell(row=r, column=c_idx).value = disp_text
                         ws.cell(row=r, column=c_idx).hyperlink = orig_url
                         ws.cell(row=r, column=c_idx).font = Font(color="0563C1", underline="single")
@@ -1163,15 +1209,16 @@ if st.session_state["workspace_area"] is None:
     with card_col1:
         with st.container(border=True):
             st.subheader("🌍 大家共用區（團隊協作）")
-            st.write("所有同行夥伴共同編輯與查詢的旅遊大本營：")
+            st.write("所有同行夥伴共同編輯與查詢的旅遊大本營（可自訂分頁排列順序）：")
             st.markdown("""
             * 📅 **每日行程排程器 ＆ AI 顧問**：日曆排程、相鄰景點距離自動提示、AI 路線健檢
             * 🏨 **住宿飯店管理**：支援單間或多間換飯店、入住/退房詳細時間與全站自動連動
             * 🗺️ **全景點互動地圖總覽**：支援小圓點 / 地圖圖釘切換，檢視景點、飯店與單日動線
             * 📋 **共用旅遊清單**：自動智慧判定商圈分區（難波/梅田/港區/京阪神奈等）與最近車站
             * 🧭 **路線與距離試算**：一鍵套用已訂飯店雙向路線、任意兩定點對比
+            * 📝 **共用筆記 ＆ 重點整理**：條理分明的筆記牆，可貼重點攻略、重要影片與置頂公告
             * 💰 **共同支出＆分帳計算機**：記錄代墊款項，即時匯率合併結算誰給誰錢
-            * 📊 **匯出精美 Excel**：含住宿飯店表、每日行程表與各分類上色分頁
+            * 📊 **匯出精美 Excel**：含住宿飯店表、每日行程表、筆記與各分類上色分頁
             """)
             st.write("")
             if st.button("🌍 進入【大家共用區】", type="primary", use_container_width=True):
@@ -1187,6 +1234,7 @@ if st.session_state["workspace_area"] is None:
             * 💱 **即時市場匯率換算**：自動抓取最新日幣匯率，勾選「已買到 ✅」即時統計花費
             * 🧳 **個人行李打包清單**：一鍵匯入日本自由行常用清單並勾選確認
             """)
+            st.write("")
             st.write("")
             st.write("")
             st.write("")
@@ -1233,29 +1281,54 @@ if st.session_state["workspace_area"] == "shared":
     df_links = load_data()
     ws_hotels = get_or_create_ws("住宿飯店", HOTEL_COLS)
     df_hotels = load_sheet_df(ws_hotels, HOTEL_COLS)
+    ws_notes = get_or_create_ws("共用筆記", NOTE_COLS)
+    df_notes = load_sheet_df(ws_notes, NOTE_COLS)
 
     has_gmap_key = bool(st.secrets.get("google_maps_api_key", "").strip())
     key_badge = "✅ Google 地圖 API 已連線" if has_gmap_key else "⚠️ 尚未偵測到 Google 地圖 API 金鑰"
-    st.caption(f"📊 目前共收錄 **{len(df_links)}** 筆景點與美食 ｜ 🏨 已預訂 **{len(df_hotels)}** 間飯店 ｜ {key_badge} ｜ [📄 開啟 Google 雲端試算表]({st.secrets['sheet_url']})")
+    st.caption(f"📊 共收錄 **{len(df_links)}** 筆景點 ｜ 🏨 已訂 **{len(df_hotels)}** 間飯店 ｜ 📝 **{len(df_notes)}** 則筆記 ｜ {key_badge} ｜ [📄 開啟 Google 試算表]({st.secrets['sheet_url']})")
 
-    tab_itin, tab_hotel, tab_map, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "📅 每日行程排程 ＆ AI 顧問",
-        "🏨 住宿飯店管理",
-        "🗺️ 互動地圖總覽",
-        "📋 共用旅遊清單",
-        "🧭 路線與距離試算",
-        "➕ 新增連結",
-        "✏️ 修改 / 刪除",
-        "💰 共同支出＆分帳計算機",
-        "📊 匯出精美 Excel"
-    ])
+    # 讀取當前使用者專屬的分頁排列順序
+    user_tab_keys = load_user_tab_order(current_user)
+
+    with st.expander("⚙️ 自訂共用區分頁順序（依照你覺得重要的程度，把常用的分頁排到最前面）"):
+        st.caption("💡 依照你希望出現的「由左至右」順序依序點選分頁（若有未選到的分頁，系統會自動補排在後方），設定僅影響你的帳號視角！")
+        label_to_key = {v: k for k, v in SHARED_TAB_LABELS.items()}
+        current_ordered_labels = [SHARED_TAB_LABELS[k] for k in user_tab_keys]
+
+        picked_labels = st.multiselect(
+            "請依序排列分頁（越前面越靠左）：",
+            options=[SHARED_TAB_LABELS[k] for k in SHARED_TAB_KEYS],
+            default=current_ordered_labels
+        )
+
+        ord_c1, ord_c2, _ = st.columns([1.5, 1.5, 4])
+        with ord_c1:
+            if st.button("💾 套用並儲存我的排序", type="primary", use_container_width=True):
+                new_keys = [label_to_key[lbl] for lbl in picked_labels]
+                for k in SHARED_TAB_KEYS:
+                    if k not in new_keys:
+                        new_keys.append(k)
+                save_user_tab_order(current_user, new_keys)
+                st.success("✅ 已儲存你的專屬分頁順序！")
+                st.rerun()
+        with ord_c2:
+            if st.button("↩️ 恢復系統預設順序", use_container_width=True):
+                save_user_tab_order(current_user, list(SHARED_TAB_KEYS))
+                st.success("✅ 已恢復預設順序！")
+                st.rerun()
+
+    # 動態產生使用者自訂順序的 Tabs 並對應回各功能區塊
+    ordered_tab_titles = [SHARED_TAB_LABELS[k] for k in user_tab_keys]
+    created_tabs = st.tabs(ordered_tab_titles)
+    tab_map = dict(zip(user_tab_keys, created_tabs))
 
     saved_start, saved_end = load_trip_dates()
     ws_itin = get_or_create_ws("每日行程", ITINERARY_COLS)
     df_itin = load_sheet_df(ws_itin, ITINERARY_COLS)
 
-    # --- 共用分頁 0：📅 每日行程排程器 ＆ AI 旅遊顧問 ---
-    with tab_itin:
+    # --- 分頁：📅 每日行程排程器 ＆ AI 旅遊顧問 ---
+    with tab_map["itin"]:
         st.subheader("📅 直覺式每日行程排程器 ＆ 🤖 AI 路線顧問")
 
         with st.container(border=True):
@@ -1646,8 +1719,8 @@ if st.session_state["workspace_area"] == "shared":
                         st.markdown("### 💡 AI 顧問分析報告")
                         st.markdown(ai_reply)
 
-    # --- 共用分頁 1：🏨 住宿飯店管理（支援單間或多間換飯店） ---
-    with tab_hotel:
+    # --- 分頁：🏨 住宿飯店管理 ---
+    with tab_map["hotel"]:
         st.subheader("🏨 住宿飯店管理（支援單間或多間換飯店行程）")
         st.caption("在這裡登錄預訂的飯店與入住/退房詳細時間後，系統會自動同步到「每日行程表」、「互動地圖」與「路線距離試算」！")
 
@@ -1804,8 +1877,8 @@ if st.session_state["workspace_area"] == "shared":
                                 st.success("✅ 飯店資訊已更新！")
                                 st.rerun()
 
-    # --- 共用分頁 2：🗺️ 全景點 ＆ 每日行程互動地圖總覽 ---
-    with tab_map:
+    # --- 分頁：🗺️ 互動地圖總覽 ---
+    with tab_map["map"]:
         st.subheader("🗺️ 全景點 ＆ 每日動線互動地圖總覽")
         st.caption("🟡 住宿飯店 ｜ 🔴 美食 ｜ 🟣 購物 ｜ 🟢 景點與地標 ｜ 🔵 交通/住宿（滑鼠移到標記上或手機點擊可查看店名與車站資訊）")
 
@@ -1920,7 +1993,7 @@ if st.session_state["workspace_area"] == "shared":
 
         else:
             if df_itin.empty:
-                st.info("目前「每日行程排程」還沒有資料，請先去第一個分頁排入行程喔！")
+                st.info("目前「每日行程排程」還沒有資料，請先去排入行程喔！")
             else:
                 df_itin_m = df_itin.copy()
                 df_itin_m["_d_num"] = df_itin_m["天數"].apply(
@@ -2012,8 +2085,8 @@ if st.session_state["workspace_area"] == "shared":
                         st.dataframe(pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
                         st.caption(f"🏁 {chosen_map_day} 全日累計直線移動距離：約 **{total_km:.2f} km**")
 
-    # --- 共用分頁 3：瀏覽共用清單（含一鍵重新智慧自動分區） ---
-    with tab1:
+    # --- 分頁：📋 共用旅遊清單 ---
+    with tab_map["list"]:
         if df_links.empty:
             st.info("目前清單空空如也，快切換到「➕ 新增連結」加入第一個大阪景點吧！")
         else:
@@ -2131,8 +2204,8 @@ if st.session_state["workspace_area"] == "shared":
                 }
             )
 
-    # --- 共用分頁 4：路線與距離試算 ---
-    with tab2:
+    # --- 分頁：🧭 路線與距離試算 ---
+    with tab_map["route"]:
         st.subheader("🧭 路線距離與電車轉乘試算")
         calc_mode = st.radio(
             "請選擇試算模式：",
@@ -2356,8 +2429,138 @@ if st.session_state["workspace_area"] == "shared":
                             }
                         )
 
-    # --- 共用分頁 5：新增連結（全自動智慧分區，免手動選區域） ---
-    with tab3:
+    # --- 分頁：📝 共用筆記 ＆ 重點整理 ---
+    with tab_map["notes"]:
+        st.subheader("📝 共用筆記 ＆ 重點整理牆")
+        st.caption("把全團需要一起看的攻略重點、必看 YouTube 影片、交通票券提醒或行前備忘整理在這裡，條理分明不洗版！")
+
+        with st.expander("➕ 新增一則共用筆記 / 攻略重點", expanded=df_notes.empty):
+            with st.form("add_shared_note_form", clear_on_submit=True):
+                nc1, nc2, nc3 = st.columns([1.8, 3.2, 1])
+                with nc1:
+                    n_tag = st.selectbox("🏷️ 筆記分類標籤", NOTE_TAG_OPTIONS)
+                with nc2:
+                    n_title = st.text_input("📌 筆記標題 *", placeholder="例如：關西機場搭南海電鐵到難波教學、環球影城快速通關攻略")
+                with nc3:
+                    st.write("")
+                    st.write("")
+                    n_pin = st.checkbox("📌 置頂顯示", value=False)
+
+                n_content = st.text_area(
+                    "📄 筆記內文（支援多行條列整理重點）*",
+                    height=140,
+                    placeholder="例如：\n1. 下飛機領完行李往 2 樓走過空橋到南海電鐵櫃檯\n2. 建議事先在 Klook 買好 Rapi:t 特急券並劃位\n3. 記得隨身攜帶護照辦退稅"
+                )
+                n_link = st.text_input("🔗 相關影片 / 參考文章連結（選填）", placeholder="https://www.youtube.com/watch?v=...")
+
+                if st.form_submit_button("✅ 發布共用筆記", type="primary"):
+                    if not n_title.strip():
+                        st.warning("⚠️ 請輸入筆記標題喔！")
+                    elif not n_content.strip():
+                        st.warning("⚠️ 請輸入筆記內文喔！")
+                    else:
+                        new_note_row = pd.DataFrame([{
+                            "置頂": "TRUE" if n_pin else "FALSE",
+                            "標籤": n_tag,
+                            "標題": n_title.strip(),
+                            "內文": n_content.strip(),
+                            "相關連結": n_link.strip(),
+                            "作者": current_user,
+                            "更新時間": get_tw_now_str()
+                        }])
+                        df_notes = pd.concat([df_notes, new_note_row], ignore_index=True)
+                        save_sheet_df(ws_notes, df_notes, NOTE_COLS)
+                        st.success(f"✅ 已發布筆記「{n_title.strip()}」！")
+                        st.rerun()
+
+        st.divider()
+
+        if df_notes.empty:
+            st.info("目前還沒有任何共用筆記，點擊上方「➕ 新增一則共用筆記 / 攻略重點」開始整理吧！")
+        else:
+            nf1, nf2 = st.columns([2.5, 2.5])
+            with nf1:
+                filter_note_tags = st.multiselect("🏷️ 依分類標籤篩選：", NOTE_TAG_OPTIONS, default=NOTE_TAG_OPTIONS)
+            with nf2:
+                search_note_kw = st.text_input("🔍 搜尋筆記標題或內文關鍵字：", placeholder="輸入關鍵字篩選...")
+
+            df_notes_disp = df_notes.copy()
+            df_notes_disp["_is_pinned"] = df_notes_disp["置頂"].apply(lambda x: str(x).strip().upper() == "TRUE")
+            df_notes_disp = df_notes_disp[df_notes_disp["標籤"].isin(filter_note_tags)]
+
+            if search_note_kw.strip():
+                kw = search_note_kw.strip().lower()
+                mask_kw = (
+                    df_notes_disp["標題"].str.lower().str.contains(kw, na=False)
+                    | df_notes_disp["內文"].str.lower().str.contains(kw, na=False)
+                )
+                df_notes_disp = df_notes_disp[mask_kw]
+
+            # 置頂的筆記排在最前面，其餘依最新更新時間排序
+            df_notes_disp = df_notes_disp.sort_values(by=["_is_pinned", "更新時間"], ascending=[False, False])
+
+            if df_notes_disp.empty:
+                st.info("找不到符合條件的筆記喔！")
+            else:
+                for orig_n_idx, nrow in df_notes_disp.iterrows():
+                    is_pinned = nrow["_is_pinned"]
+                    pin_badge = "📌 【置頂】" if is_pinned else ""
+                    with st.container(border=True):
+                        nh1, nh2 = st.columns([5.5, 1.5])
+                        with nh1:
+                            st.markdown(f"#### {pin_badge}`{nrow['標籤']}` {nrow['標題']}")
+                            st.caption(f"✍️ 整理者：**{nrow['作者']}** ｜ 🕒 更新於：{nrow['更新時間']}")
+                        with nh2:
+                            if str(nrow["相關連結"]).strip().startswith("http"):
+                                st.link_button("🎬 開啟相關連結", str(nrow["相關連結"]).strip(), use_container_width=True)
+
+                        st.markdown(nrow["內文"])
+
+                        with st.expander("✏️ 編輯 / 置頂 / 刪除此則筆記"):
+                            with st.form(f"edit_note_form_{orig_n_idx}"):
+                                ec_n1, ec_n2, ec_n3 = st.columns([1.8, 3.2, 1])
+                                with ec_n1:
+                                    cur_tag_idx = NOTE_TAG_OPTIONS.index(nrow["標籤"]) if nrow["標籤"] in NOTE_TAG_OPTIONS else 0
+                                    ed_n_tag = st.selectbox("分類標籤", NOTE_TAG_OPTIONS, index=cur_tag_idx)
+                                with ec_n2:
+                                    ed_n_title = st.text_input("筆記標題", value=str(nrow["標題"]))
+                                with ec_n3:
+                                    st.write("")
+                                    st.write("")
+                                    ed_n_pin = st.checkbox("📌 置頂", value=is_pinned)
+
+                                ed_n_content = st.text_area("筆記內文", value=str(nrow["內文"]), height=130)
+                                ed_n_link = st.text_input("相關連結", value=str(nrow["相關連結"]))
+
+                                btn_n1, btn_n2 = st.columns([2, 1])
+                                with btn_n1:
+                                    save_n_btn = st.form_submit_button("💾 儲存筆記修改", type="primary", use_container_width=True)
+                                with btn_n2:
+                                    del_n_btn = st.form_submit_button("🗑️ 刪除此筆記", type="secondary", use_container_width=True)
+
+                                if save_n_btn:
+                                    if not ed_n_title.strip() or not ed_n_content.strip():
+                                        st.warning("⚠️ 標題與內文不能為空喔！")
+                                    else:
+                                        df_notes.at[orig_n_idx, "置頂"] = "TRUE" if ed_n_pin else "FALSE"
+                                        df_notes.at[orig_n_idx, "標籤"] = ed_n_tag
+                                        df_notes.at[orig_n_idx, "標題"] = ed_n_title.strip()
+                                        df_notes.at[orig_n_idx, "內文"] = ed_n_content.strip()
+                                        df_notes.at[orig_n_idx, "相關連結"] = ed_n_link.strip()
+                                        df_notes.at[orig_n_idx, "作者"] = current_user
+                                        df_notes.at[orig_n_idx, "更新時間"] = get_tw_now_str()
+                                        save_sheet_df(ws_notes, df_notes, NOTE_COLS)
+                                        st.success("✅ 筆記已更新！")
+                                        st.rerun()
+
+                                if del_n_btn:
+                                    df_notes = df_notes.drop(orig_n_idx).reset_index(drop=True)
+                                    save_sheet_df(ws_notes, df_notes, NOTE_COLS)
+                                    st.success("✅ 已刪除此則筆記！")
+                                    st.rerun()
+
+    # --- 分頁：➕ 新增連結 ---
+    with tab_map["add"]:
         with st.form("add_link_form", clear_on_submit=True):
             st.subheader("新增景點 / 餐廳 / 購物連結")
             st.caption("✨ 貼上網址或輸入店名後，系統會透過 Google API 自動定位座標、反查最近車站，並**自動判斷所屬商圈分區**！")
@@ -2421,8 +2624,8 @@ if st.session_state["workspace_area"] == "shared":
                             st.success(f"✅ 新增成功！「{fetched_title}」｜自動分區：【{auto_region}】｜{subway_result}")
                             st.rerun()
 
-    # --- 共用分頁 6：修改 / 刪除 ---
-    with tab4:
+    # --- 分頁：✏️ 修改 / 刪除 ---
+    with tab_map["edit"]:
         if df_links.empty:
             st.info("目前清單沒有任何資料可以修改或刪除。")
         else:
@@ -2488,8 +2691,8 @@ if st.session_state["workspace_area"] == "shared":
                 st.success("✅ 已成功刪除該筆連結！")
                 st.rerun()
 
-    # --- 共用分頁 7：💰 共同支出記帳＆自動分帳計算機 ---
-    with tab5:
+    # --- 分頁：💰 共同支出記帳＆自動分帳計算機 ---
+    with tab_map["expense"]:
         st.subheader("💰 共同支出記帳區 ＆ 自動分帳計算機")
         live_rate, rate_status, _ = fetch_live_jpy_to_twd()
 
@@ -2648,14 +2851,14 @@ if st.session_state["workspace_area"] == "shared":
                             for debtor, creditor, amt in twd_transfers:
                                 st.warning(f"💸 **{debtor}** ➔ 轉給 **{creditor}**：**NT$ {amt:,} TWD**")
 
-    # --- 共用分頁 8：匯出精美 Excel ---
-    with tab6:
-        st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、智慧判定商圈分區並依區域上色分類，產生包含「住宿飯店表」、「每日行程表」、「總表」與各分類分頁的 Excel 檔案。")
-        if df_links.empty and df_itin.empty and df_hotels.empty:
+    # --- 分頁：📊 匯出精美 Excel ---
+    with tab_map["excel"]:
+        st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、智慧判定商圈分區並依區域上色分類，產生包含「住宿飯店表」、「每日行程表」、「共用筆記整理」、「總表」與各分類分頁的 Excel 檔案。")
+        if df_links.empty and df_itin.empty and df_hotels.empty and df_notes.empty:
             st.info("目前沒有資料可以匯出喔！")
         else:
             if st.button("🚀 開始統整並產生 Excel", type="primary"):
-                excel_data = generate_styled_excel(df_links.copy(), df_itin.copy(), df_hotels.copy())
+                excel_data = generate_styled_excel(df_links.copy(), df_itin.copy(), df_hotels.copy(), df_notes.copy())
                 ts = datetime.datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S")
                 st.session_state["excel_bytes"] = excel_data
                 st.session_state["excel_filename"] = f"大阪旅遊統整表_{ts}.xlsx"
