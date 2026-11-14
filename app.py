@@ -34,6 +34,7 @@ SHOPPING_COLS = ["擁有者", "商品名稱", "分類", "購買地點", "日幣�
 PACKING_COLS = ["擁有者", "分類", "物品名稱", "數量", "已打包"]
 ITINERARY_COLS = ["天數", "日期", "時間", "行程名稱", "分類", "最近車站", "網址", "備註", "排程者"]
 HOTEL_COLS = ["飯店名稱", "網址", "入住日期", "入住時間", "退房日期", "退房時間", "最近車站", "訂房備註", "新增者"]
+FLIGHT_COLS = ["航段類型", "航空與班次", "出發機場航廈", "起飛日期", "起飛時間", "抵達機場航廈", "抵達日期", "抵達時間", "訂位與行李備註", "新增者"]
 NOTE_COLS = ["置頂", "標籤", "標題", "內文", "相關連結", "作者", "更新時間"]
 META_COLS = ["設定鍵", "設定值"]
 
@@ -42,11 +43,12 @@ REGION_OPTIONS = ["難波/心齋橋", "梅田", "天王寺/阿倍野", "環球�
 SHOP_CAT_OPTIONS = ["藥妝美妝", "伴手禮/零食", "服飾/精品", "動漫/雜貨", "親友代購", "其他"]
 PACK_CAT_OPTIONS = ["重要證件/錢包", "3C電子/網路", "衣物穿搭", "盥洗/常備藥品", "隨身小物", "其他"]
 NOTE_TAG_OPTIONS = ["📌 行前攻略", "🚃 交通票券", "🎬 必看影片", "🍜 美食筆記", "🛍️ 購物退稅", "⚠️ 注意事項", "📝 其他筆記"]
+FLIGHT_LEG_OPTIONS = ["🛫 去程航班", "🛬 回程航班", "✈️ 轉機 / 國內線"]
 WEEKDAY_ZH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
 
 SHARED_TAB_KEYS = [
     "itin",
-    "hotel",
+    "flight_hotel",
     "map",
     "list",
     "route",
@@ -59,7 +61,7 @@ SHARED_TAB_KEYS = [
 
 SHARED_TAB_LABELS = {
     "itin": "📅 每日行程排程 ＆ AI 顧問",
-    "hotel": "🏨 住宿飯店管理",
+    "flight_hotel": "✈️ 機票 ＆ 住宿整理",
     "map": "🗺️ 互動地圖總覽",
     "list": "📋 共用旅遊清單",
     "route": "🧭 路線與距離試算",
@@ -383,12 +385,16 @@ def save_trip_dates(start_date, end_date):
     save_sheet_df(ws_meta, df_meta, META_COLS)
 
 def load_user_tab_order(username):
-    """讀取該使用者自訂的共用區分頁順序"""
+    """讀取該使用者自訂的共用區分頁順序（自動相容舊版 hotel 鍵值）"""
     df_meta = load_sheet_df("旅遊設定", META_COLS)
     meta_dict = dict(zip(df_meta["設定鍵"], df_meta["設定值"]))
     raw_order = meta_dict.get(f"tab_order_{username}", "")
     if raw_order:
-        saved_keys = [k.strip() for k in raw_order.split(",") if k.strip() in SHARED_TAB_KEYS]
+        saved_keys = []
+        for raw_k in raw_order.split(","):
+            k = "flight_hotel" if raw_k.strip() == "hotel" else raw_k.strip()
+            if k in SHARED_TAB_KEYS and k not in saved_keys:
+                saved_keys.append(k)
         for k in SHARED_TAB_KEYS:
             if k not in saved_keys:
                 saved_keys.append(k)
@@ -427,6 +433,18 @@ def get_hotel_events_for_date(df_hotels, target_date):
             staying.append(h)
 
     return checkouts, checkins, staying
+
+def get_flight_events_for_date(df_flights, target_date):
+    flights_on_day = []
+    if df_flights is None or df_flights.empty:
+        return flights_on_day
+
+    for _, f in df_flights.iterrows():
+        dep_str = str(f["起飛日期"]).strip()
+        arr_str = str(f["抵達日期"]).strip()
+        if target_date.isoformat() in [dep_str, arr_str]:
+            flights_on_day.append(f)
+    return flights_on_day
 
 # ==========================================
 # 4. 帳號驗證、分帳與 AI 助手工具
@@ -539,7 +557,7 @@ def calculate_combined_twd_settlements(df_exp, jpy_to_twd_rate):
 
     return _solve_debt_graph(paid_map, owed_map)
 
-def ask_travel_ai_assistant(user_prompt, df_itin, df_links, df_hotels, trip_days_info):
+def ask_travel_ai_assistant(user_prompt, df_itin, df_links, df_hotels, df_flights, trip_days_info):
     gemini_key = st.secrets.get("gemini_api_key", "").strip()
     if not gemini_key:
         return "⚠️ 尚未設定 `gemini_api_key`！請在 Streamlit Secrets 貼上免費的 Google AI Studio API Key 即可啟用 AI 旅遊小助手。"
@@ -547,6 +565,15 @@ def ask_travel_ai_assistant(user_prompt, df_itin, df_links, df_hotels, trip_days
     try:
         from google import genai
         client = genai.Client(api_key=gemini_key)
+
+        flight_text = "（尚未登錄航班機票資訊）"
+        if df_flights is not None and not df_flights.empty:
+            f_lines = []
+            for _, f in df_flights.iterrows():
+                f_lines.append(
+                    f"- [{f['航段類型']}] {f['航空與班次']}｜出發：{f['出發機場航廈']} ({f['起飛日期']} {f['起飛時間']}) ➔ 抵達：{f['抵達機場航廈']} ({f['抵達日期']} {f['抵達時間']})｜備註：{f['訂位與行李備註']}"
+                )
+            flight_text = "\n".join(f_lines)
 
         hotel_text = "（尚未登錄預訂飯店）"
         if df_hotels is not None and not df_hotels.empty:
@@ -578,10 +605,13 @@ def ask_travel_ai_assistant(user_prompt, df_itin, df_links, df_hotels, trip_days
 
         system_context = f"""
 你是一位專業、貼心且熟悉日本大阪、京都、神戶、奈良自由行的「AI 旅遊規劃小助手」。
-請根據以下這組旅客的真實住宿飯店、行程與收藏清單，用繁體中文給出具體、實用、條理分明的建議（包含每天從住宿飯店出發/返回是否順路、換飯店日的行李寄放與移動建議、營業時間/排隊提醒等）。
+請根據以下這組旅客的真實航班起降時間、住宿飯店、行程與收藏清單，用繁體中文給出具體、實用、條理分明的建議（包含首日下飛機後往市區/飯店的交通銜接、末日前往機場的建議出發時間、每天從住宿飯店出發/返回是否順路、換飯店日的行李寄放與移動建議等）。
 
 【旅程天數資訊】
 {trip_days_info}
+
+【已登錄的機票航班資訊】
+{flight_text}
 
 【已預訂的住宿飯店（含入住與退房時間）】
 {hotel_text}
@@ -964,9 +994,9 @@ def build_route_comparison_row(orig_obj, dest_obj):
     }
 
 # ==========================================
-# 6. 產生美化 Excel 報表（含每日行程表、住宿飯店與共用筆記分頁）
+# 6. 產生美化 Excel 報表（含機票航班、住宿飯店、每日行程與筆記分頁）
 # ==========================================
-def generate_styled_excel(df_links, df_itin=None, df_hotels=None, df_notes=None):
+def generate_styled_excel(df_links, df_itin=None, df_hotels=None, df_flights=None, df_notes=None):
     all_list = []
     food_list, shop_list, spot_list, other_list = [], [], [], []
     sheet_updated = False
@@ -1078,6 +1108,11 @@ def generate_styled_excel(df_links, df_itin=None, df_hotels=None, df_notes=None)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         sheets_written = []
+        if df_flights is not None and not df_flights.empty:
+            df_flights_sorted = df_flights.sort_values(by=["起飛日期", "起飛時間"]).copy()
+            df_flights_sorted.to_excel(writer, sheet_name="✈️ 機票航班表", index=False)
+            sheets_written.append("✈️ 機票航班表")
+
         if df_hotels is not None and not df_hotels.empty:
             df_hotels_sorted = df_hotels.sort_values(by=["入住日期"]).copy()
             df_hotels_sorted.to_excel(writer, sheet_name="🏨 住宿飯店表", index=False)
@@ -1256,13 +1291,13 @@ if st.session_state["workspace_area"] is None:
             st.write("所有同行夥伴共同編輯與查詢的旅遊大本營（可自訂分頁排列順序）：")
             st.markdown("""
             * 📅 **每日行程排程器 ＆ AI 顧問**：日曆排程、相鄰景點距離自動提示、AI 路線健檢
-            * 🏨 **住宿飯店管理**：支援單間或多間換飯店、入住/退房詳細時間與全站自動連動
+            * ✈️ **機票 ＆ 住宿整理**：並排憑證看板，整合去回程航班、航廈、訂位代號與住宿資訊
             * 🗺️ **全景點互動地圖總覽**：支援小圓點 / 地圖圖釘切換，檢視景點、飯店與單日動線
             * 📋 **共用旅遊清單**：自動智慧判定商圈分區（難波/梅田/港區/京阪神奈等）與最近車站
             * 🧭 **路線與距離試算**：一鍵套用已訂飯店雙向路線、任意兩定點對比
             * 📝 **共用筆記 ＆ 重點整理**：條理分明的筆記牆，可貼重點攻略、重要影片與置頂公告
             * 💰 **共同支出＆分帳計算機**：記錄代墊款項，即時匯率合併結算誰給誰錢
-            * 📊 **匯出精美 Excel**：含住宿飯店表、每日行程表、筆記與各分類上色分頁
+            * 📊 **匯出精美 Excel**：含機票航班、住宿飯店、每日行程、筆記與各分類上色分頁
             """)
             st.write("")
             if st.button("🌍 進入【大家共用區】", type="primary", use_container_width=True):
@@ -1323,12 +1358,13 @@ st.divider()
 # ==============================================================================
 if st.session_state["workspace_area"] == "shared":
     df_links = load_data()
+    df_flights = load_sheet_df("機票航班", FLIGHT_COLS)
     df_hotels = load_sheet_df("住宿飯店", HOTEL_COLS)
     df_notes = load_sheet_df("共用筆記", NOTE_COLS)
 
     has_gmap_key = bool(st.secrets.get("google_maps_api_key", "").strip())
     key_badge = "✅ Google 地圖 API 已連線" if has_gmap_key else "⚠️ 尚未偵測到 Google 地圖 API 金鑰"
-    st.caption(f"📊 共收錄 **{len(df_links)}** 筆景點 ｜ 🏨 已訂 **{len(df_hotels)}** 間飯店 ｜ 📝 **{len(df_notes)}** 則筆記 ｜ {key_badge} ｜ [📄 開啟 Google 試算表]({st.secrets['sheet_url']})")
+    st.caption(f"📊 共收錄 **{len(df_links)}** 筆景點 ｜ ✈️ **{len(df_flights)}** 筆航班 ｜ 🏨 **{len(df_hotels)}** 間飯店 ｜ 📝 **{len(df_notes)}** 則筆記 ｜ {key_badge} ｜ [📄 開啟 Google 試算表]({st.secrets['sheet_url']})")
 
     # 讀取當前使用者專屬的分頁排列順序
     user_tab_keys = load_user_tab_order(current_user)
@@ -1535,13 +1571,13 @@ if st.session_state["workspace_area"] == "shared":
         with view_c1:
             view_mode = st.radio(
                 "👀 選擇行程呈現模式：",
-                ["⏳ 時間軸卡片模式（含相鄰景點距離與住宿提示）", "📊 總覽表格模式（一眼看全趟行程表）"],
+                ["⏳ 時間軸卡片模式（含相鄰景點距離與航班/住宿提示）", "📊 總覽表格模式（一眼看全趟行程表）"],
                 horizontal=True
             )
         with view_c2:
             filter_day_choice = st.selectbox("篩選檢視天數：", ["全部天數總覽"] + day_options)
 
-        if df_itin.empty and df_hotels.empty:
+        if df_itin.empty and df_hotels.empty and df_flights.empty:
             st.info("目前行程表還是空的，快從上方步驟 2 開始把景點排進每一天吧！")
         else:
             df_itin["_day_num"] = df_itin["天數"].apply(
@@ -1570,53 +1606,61 @@ if st.session_state["workspace_area"] == "shared":
                         st.markdown(f"### 🗓️ {day_tag} ｜ {date_label}")
 
                         cur_date_obj = day_date_obj_map.get(day_tag)
-                        if cur_date_obj and not df_hotels.empty:
-                            co_list, ci_list, stay_list = get_hotel_events_for_date(df_hotels, cur_date_obj)
-                            hotel_msgs = []
-                            for h in co_list:
-                                hotel_msgs.append(f"🧳 **上午退房**：{h['飯店名稱']}（退房時間 `{h['退房時間']}`）")
-                            for h in ci_list:
-                                hotel_msgs.append(f"🔑 **下午入住**：{h['飯店名稱']}（入住時間 `{h['入住時間']}`｜{h['最近車站']}）")
-                            if not ci_list and stay_list:
-                                h = stay_list[0]
-                                hotel_msgs.append(f"🏨 **今晚下榻飯店**：{h['飯店名稱']}（{h['最近車站']}）")
+                        if cur_date_obj:
+                            day_flights = get_flight_events_for_date(df_flights, cur_date_obj)
+                            for fl in day_flights:
+                                st.warning(
+                                    f"✈️ **當日航班（{fl['航段類型']}）**：**{fl['航空與班次']}** ｜ "
+                                    f"`{fl['起飛時間']}` {fl['出發機場航廈']} ➔ `{fl['抵達時間']}` {fl['抵達機場航廈']}"
+                                )
 
-                            if hotel_msgs:
-                                h_col1, h_col2 = st.columns([4, 1.5])
-                                with h_col1:
-                                    st.info(" ｜ ".join(hotel_msgs))
-                                with h_col2:
-                                    if ci_list or co_list:
-                                        if st.button(f"➕ 一鍵把入住/退房排入 {day_tag}", key=f"auto_add_hotel_{day_tag}", use_container_width=True):
-                                            added_rows = []
-                                            for h in co_list:
-                                                added_rows.append({
-                                                    "天數": day_tag,
-                                                    "日期": date_label,
-                                                    "時間": str(h["退房時間"]).strip() or "11:00",
-                                                    "行程名稱": f"🏨 飯店退房：{h['飯店名稱']}",
-                                                    "分類": "交通/住宿",
-                                                    "最近車站": str(h["最近車站"]).strip(),
-                                                    "網址": str(h["網址"]).strip(),
-                                                    "備註": str(h["訂房備註"]).strip(),
-                                                    "排程者": current_user
-                                                })
-                                            for h in ci_list:
-                                                added_rows.append({
-                                                    "天數": day_tag,
-                                                    "日期": date_label,
-                                                    "時間": str(h["入住時間"]).strip() or "15:00",
-                                                    "行程名稱": f"🔑 飯店入住：{h['飯店名稱']}",
-                                                    "分類": "交通/住宿",
-                                                    "最近車站": str(h["最近車站"]).strip(),
-                                                    "網址": str(h["網址"]).strip(),
-                                                    "備註": str(h["訂房備註"]).strip(),
-                                                    "排程者": current_user
-                                                })
-                                            df_itin_clean = df_itin.drop(columns=["_day_num"], errors="ignore")
-                                            df_itin_clean = pd.concat([df_itin_clean, pd.DataFrame(added_rows)], ignore_index=True)
-                                            save_sheet_df("每日行程", df_itin_clean, ITINERARY_COLS)
-                                            st.rerun()
+                            if not df_hotels.empty:
+                                co_list, ci_list, stay_list = get_hotel_events_for_date(df_hotels, cur_date_obj)
+                                hotel_msgs = []
+                                for h in co_list:
+                                    hotel_msgs.append(f"🧳 **上午退房**：{h['飯店名稱']}（退房時間 `{h['退房時間']}`）")
+                                for h in ci_list:
+                                    hotel_msgs.append(f"🔑 **下午入住**：{h['飯店名稱']}（入住時間 `{h['入住時間']}`｜{h['最近車站']}）")
+                                if not ci_list and stay_list:
+                                    h = stay_list[0]
+                                    hotel_msgs.append(f"🏨 **今晚下榻飯店**：{h['飯店名稱']}（{h['最近車站']}）")
+
+                                if hotel_msgs:
+                                    h_col1, h_col2 = st.columns([4, 1.5])
+                                    with h_col1:
+                                        st.info(" ｜ ".join(hotel_msgs))
+                                    with h_col2:
+                                        if ci_list or co_list:
+                                            if st.button(f"➕ 一鍵把入住/退房排入 {day_tag}", key=f"auto_add_hotel_{day_tag}", use_container_width=True):
+                                                added_rows = []
+                                                for h in co_list:
+                                                    added_rows.append({
+                                                        "天數": day_tag,
+                                                        "日期": date_label,
+                                                        "時間": str(h["退房時間"]).strip() or "11:00",
+                                                        "行程名稱": f"🏨 飯店退房：{h['飯店名稱']}",
+                                                        "分類": "交通/住宿",
+                                                        "最近車站": str(h["最近車站"]).strip(),
+                                                        "網址": str(h["網址"]).strip(),
+                                                        "備註": str(h["訂房備註"]).strip(),
+                                                        "排程者": current_user
+                                                    })
+                                                for h in ci_list:
+                                                    added_rows.append({
+                                                        "天數": day_tag,
+                                                        "日期": date_label,
+                                                        "時間": str(h["入住時間"]).strip() or "15:00",
+                                                        "行程名稱": f"🔑 飯店入住：{h['飯店名稱']}",
+                                                        "分類": "交通/住宿",
+                                                        "最近車站": str(h["最近車站"]).strip(),
+                                                        "網址": str(h["網址"]).strip(),
+                                                        "備註": str(h["訂房備註"]).strip(),
+                                                        "排程者": current_user
+                                                    })
+                                                df_itin_clean = df_itin.drop(columns=["_day_num"], errors="ignore")
+                                                df_itin_clean = pd.concat([df_itin_clean, pd.DataFrame(added_rows)], ignore_index=True)
+                                                save_sheet_df("每日行程", df_itin_clean, ITINERARY_COLS)
+                                                st.rerun()
 
                         places_for_route = [
                             urllib.parse.quote(f"関西 {str(row['行程名稱']).replace('🏨 飯店退房：', '').replace('🔑 飯店入住：', '').strip()}")
@@ -1742,12 +1786,12 @@ if st.session_state["workspace_area"] == "shared":
                    `gemini_api_key = "你的免費金鑰"` 並按 Save 即可開始跟 AI 對話！
                 """)
             else:
-                st.caption("AI 小助手已自動讀取你們的「住宿飯店資訊」、「每日行程表」與「全團收藏清單」，你可以點下方快捷按鈕或直接發問：")
+                st.caption("AI 小助手已自動讀取你們的「機票航班時間」、「住宿飯店資訊」、「每日行程表」與「全團收藏清單」，你可以點下方快捷按鈕或直接發問：")
                 q_b1, q_b2, q_b3 = st.columns(3)
                 quick_ai_prompt = ""
                 with q_b1:
                     if st.button("🔍 幫我健檢目前排程順不順？", use_container_width=True):
-                        quick_ai_prompt = "請結合我們預訂的住宿飯店位置與入住退房時間，檢查目前已經排入的每日行程，分析每天從飯店出發與返回的交通是否順路、有沒有走回頭路、換飯店當天行李怎麼處理最順，並給出具體調整建議。"
+                        quick_ai_prompt = "請結合我們的航班起降時間、預訂的住宿飯店位置與入住退房時間，檢查目前已經排入的每日行程，分析首末日往返機場時間是否充裕、每天從飯店出發與返回的交通是否順路，並給出具體調整建議。"
                 with q_b2:
                     if st.button("🧩 還沒排的景點怎麼塞進空檔？", use_container_width=True):
                         quick_ai_prompt = "請比對『已排入的每日行程』、『住宿飯店周邊』與『全團收藏清單中還沒排進去的景點/美食』，幫我推薦哪些未排入的店剛好順路可以塞進哪一天的空檔？"
@@ -1759,7 +1803,7 @@ if st.session_state["workspace_area"] == "shared":
                     "💬 或者直接輸入你想問 AI 小助手的問題：",
                     value=quick_ai_prompt,
                     height=90,
-                    placeholder="例如：換飯店那天早上退房後，把行李寄放在哪個車站最順路？"
+                    placeholder="例如：回程飛機起飛前幾點從飯店出發去關西機場最保險？"
                 )
 
                 if st.button("✨ 請 AI 小助手分析建議", type="primary"):
@@ -1767,116 +1811,285 @@ if st.session_state["workspace_area"] == "shared":
                         st.warning("⚠️ 請先輸入問題或點擊上方快捷按鈕喔！")
                     else:
                         trip_info_str = f"{active_start.strftime('%Y/%m/%d')} 至 {active_end.strftime('%Y/%m/%d')}（共 {total_days} 天）"
-                        with st.spinner("🤖 AI 小助手正在比對住宿飯店、所有景點車站與行程動線中..."):
+                        with st.spinner("🤖 AI 小助手正在比對航班時間、住宿飯店、所有景點車站與行程動線中..."):
                             ai_reply = ask_travel_ai_assistant(
                                 user_ai_q.strip(),
                                 df_itin.drop(columns=["_day_num"], errors="ignore"),
                                 df_links,
                                 df_hotels,
+                                df_flights,
                                 trip_info_str
                             )
                         st.markdown("### 💡 AI 顧問分析報告")
                         st.markdown(ai_reply)
 
-    # --- 分頁：🏨 住宿飯店管理 ---
-    with tab_map["hotel"]:
-        st.subheader("🏨 住宿飯店管理（支援單間或多間換飯店行程）")
-        st.caption("在這裡登錄預訂的飯店與入住/退房詳細時間後，系統會自動同步到「每日行程表」、「互動地圖」與「路線距離試算」！")
+    # --- 分頁：✈️ 機票 ＆ 住宿整理 ---
+    with tab_map["flight_hotel"]:
+        st.subheader("✈️ 機票 ＆ 住宿確定資訊總覽")
+        st.caption("把整趟旅程確定的機票航班、航廈、訂位代號與住宿飯店並排整理在這裡，出國查憑證一眼看完，並自動連動到每日行程表與地圖！")
 
-        with st.container(border=True):
-            st.markdown("**➕ 新增預訂飯店**")
-            default_ci_date = saved_start if saved_start else datetime.date.today() + timedelta(days=14)
-            default_co_date = saved_end if saved_end else default_ci_date + timedelta(days=4)
+        default_ci_date = saved_start if saved_start else datetime.date.today() + timedelta(days=14)
+        default_co_date = saved_end if saved_end else default_ci_date + timedelta(days=4)
 
-            with st.form("add_hotel_form", clear_on_submit=True):
-                hc1, hc2 = st.columns([3, 3])
-                with hc1:
-                    h_name = st.text_input("🏨 飯店名稱 *", placeholder="例如：難波東方酒店 / 阪急龍仕柏飯店")
-                with hc2:
-                    h_url = st.text_input("🔗 Google Maps 網址或訂房連結（選填）", placeholder="https://maps.app.goo.gl/...")
+        # ==========================================
+        # 上半部：並排檢視卡片（左：機票航班 ｜ 右：住宿飯店）
+        # ==========================================
+        view_fl_col, view_ht_col = st.columns(2)
 
-                hc3, hc4, hc5, hc6 = st.columns([2, 1.5, 2, 1.5])
-                with hc3:
-                    h_ci_date = st.date_input("📅 入住日期 *", value=default_ci_date)
-                with hc4:
-                    h_ci_time = st.time_input("🕒 入住時間 *", value=datetime.time(15, 0), step=900)
-                with hc5:
-                    h_co_date = st.date_input("📅 退房日期 *", value=default_co_date)
-                with hc6:
-                    h_co_time = st.time_input("🕚 退房時間 *", value=datetime.time(11, 0), step=900)
-
-                h_note = st.text_input("📝 訂房備註（選填）", placeholder="例如：Agoda 訂房代號 #123456、含雙人早餐、可免費寄放行李")
-
-                if st.form_submit_button("✅ 儲存這間飯店資訊", type="primary"):
-                    if not h_name.strip():
-                        st.warning("⚠️ 請輸入飯店名稱喔！")
-                    elif h_co_date < h_ci_date:
-                        st.error("❌ 退房日期不能早於入住日期喔！")
-                    else:
-                        with st.spinner("🔍 正在透過 Google API 解析飯店座標與最近地鐵/電鐵站..."):
-                            _, resolved_sub = resolve_place_and_subway(h_url.strip(), h_name.strip(), "", h_note.strip())
-
-                        new_h = pd.DataFrame([{
-                            "飯店名稱": h_name.strip(),
-                            "網址": h_url.strip(),
-                            "入住日期": h_ci_date.isoformat(),
-                            "入住時間": h_ci_time.strftime("%H:%M"),
-                            "退房日期": h_co_date.isoformat(),
-                            "退房時間": h_co_time.strftime("%H:%M"),
-                            "最近車站": resolved_sub,
-                            "訂房備註": h_note.strip(),
-                            "新增者": current_user
-                        }])
-                        df_hotels = pd.concat([df_hotels, new_h], ignore_index=True)
-                        save_sheet_df("住宿飯店", df_hotels, HOTEL_COLS)
-                        st.success(f"✅ 已成功新增飯店「{h_name.strip()}」！")
-                        st.rerun()
-
-        st.divider()
-
-        if df_hotels.empty:
-            st.info("目前尚未登錄任何預訂飯店，快從上方新增第一間住宿飯店吧！")
-        else:
-            st.markdown("### 🛏️ 已預訂住宿清單（依入住日期排序）")
-            df_hotels_sorted = df_hotels.sort_values(by=["入住日期"]).copy()
-
-            for h_idx, h_row in df_hotels_sorted.iterrows():
-                try:
-                    d_in = datetime.date.fromisoformat(str(h_row["入住日期"]).strip())
-                    d_out = datetime.date.fromisoformat(str(h_row["退房日期"]).strip())
-                    nights = max(1, (d_out - d_in).days)
-                    in_disp = f"{d_in.strftime('%Y/%m/%d')} ({WEEKDAY_ZH[d_in.weekday()]}) {h_row['入住時間']}"
-                    out_disp = f"{d_out.strftime('%Y/%m/%d')} ({WEEKDAY_ZH[d_out.weekday()]}) {h_row['退房時間']}"
-                    stay_badge = f"共 {nights} 晚"
-                except Exception:
-                    in_disp = f"{h_row['入住日期']} {h_row['入住時間']}"
-                    out_disp = f"{h_row['退房日期']} {h_row['退房時間']}"
-                    stay_badge = ""
-
+        with view_fl_col:
+            st.markdown("#### ✈️ 航班機票資訊")
+            if df_flights.empty:
                 with st.container(border=True):
-                    hc_left, hc_right = st.columns([5, 1.5])
-                    with hc_left:
-                        st.markdown(f"#### 🏨 {h_row['飯店名稱']} `{stay_badge}`")
-                        st.markdown(f"🔑 **入住**：`{in_disp}`  ➡️  🧳 **退房**：`{out_disp}`")
+                    st.info("尚未登錄機票資訊，請從下方「➕ 新增機票航班」填寫去回程班次！")
+            else:
+                df_flights_sorted = df_flights.sort_values(by=["起飛日期", "起飛時間"]).copy()
+                for _, f_row in df_flights_sorted.iterrows():
+                    try:
+                        d_dep = datetime.date.fromisoformat(str(f_row["起飛日期"]).strip())
+                        dep_d_disp = f"{d_dep.strftime('%m/%d')} ({WEEKDAY_ZH[d_dep.weekday()]})"
+                    except Exception:
+                        dep_d_disp = str(f_row["起飛日期"]).strip()
+
+                    try:
+                        d_arr = datetime.date.fromisoformat(str(f_row["抵達日期"]).strip())
+                        arr_d_disp = f"{d_arr.strftime('%m/%d')} ({WEEKDAY_ZH[d_arr.weekday()]})"
+                    except Exception:
+                        arr_d_disp = str(f_row["抵達日期"]).strip()
+
+                    with st.container(border=True):
+                        st.markdown(f"`{f_row['航段類型']}` **{f_row['航空與班次']}**")
+                        st.markdown(
+                            f"🛫 **出發**：{f_row['出發機場航廈']} ｜ `{dep_d_disp} {f_row['起飛時間']}`\n\n"
+                            f"🛬 **抵達**：{f_row['抵達機場航廈']} ｜ `{arr_d_disp} {f_row['抵達時間']}`"
+                        )
+                        if str(f_row["訂位與行李備註"]).strip():
+                            st.caption(f"🎫 {f_row['訂位與行李備註']}")
+
+        with view_ht_col:
+            st.markdown("#### 🏨 住宿飯店資訊")
+            if df_hotels.empty:
+                with st.container(border=True):
+                    st.info("尚未登錄住宿飯店，請從下方「➕ 新增住宿飯店」填寫訂房資訊！")
+            else:
+                df_hotels_sorted = df_hotels.sort_values(by=["入住日期"]).copy()
+                for _, h_row in df_hotels_sorted.iterrows():
+                    try:
+                        d_in = datetime.date.fromisoformat(str(h_row["入住日期"]).strip())
+                        d_out = datetime.date.fromisoformat(str(h_row["退房日期"]).strip())
+                        nights = max(1, (d_out - d_in).days)
+                        in_disp = f"{d_in.strftime('%m/%d')} ({WEEKDAY_ZH[d_in.weekday()]}) {h_row['入住時間']}"
+                        out_disp = f"{d_out.strftime('%m/%d')} ({WEEKDAY_ZH[d_out.weekday()]}) {h_row['退房時間']}"
+                        stay_badge = f"共 {nights} 晚"
+                    except Exception:
+                        in_disp = f"{h_row['入住日期']} {h_row['入住時間']}"
+                        out_disp = f"{h_row['退房日期']} {h_row['退房時間']}"
+                        stay_badge = ""
+
+                    with st.container(border=True):
+                        h_top1, h_top2 = st.columns([3.5, 1.3])
+                        with h_top1:
+                            st.markdown(f"**🏨 {h_row['飯店名稱']}** `{stay_badge}`")
+                        with h_top2:
+                            gmap_h_url = str(h_row["網址"]).strip()
+                            if not gmap_h_url.startswith("http"):
+                                q_h = urllib.parse.quote(f"関西 {h_row['飯店名稱']}")
+                                gmap_h_url = f"https://www.google.com/maps/search/?api=1&query={q_h}"
+                            st.link_button("📍 地圖", gmap_h_url, use_container_width=True)
+
+                        st.markdown(f"🔑 **入住**：`{in_disp}` ➡️ 🧳 **退房**：`{out_disp}`")
                         if str(h_row["最近車站"]).strip():
                             st.caption(f"🚉 {h_row['最近車站']}")
                         if str(h_row["訂房備註"]).strip():
-                            st.write(f"📝 {h_row['訂房備註']}")
+                            st.caption(f"📝 {h_row['訂房備註']}")
 
-                    with hc_right:
-                        gmap_h_url = str(h_row["網址"]).strip()
-                        if not gmap_h_url.startswith("http"):
-                            q_h = urllib.parse.quote(f"関西 {h_row['飯店名稱']}")
-                            gmap_h_url = f"https://www.google.com/maps/search/?api=1&query={q_h}"
-                        st.link_button("📍 地圖導航", gmap_h_url, use_container_width=True)
+        st.divider()
 
-                        if st.button("🗑️ 刪除飯店", key=f"del_hotel_{h_idx}", use_container_width=True):
-                            df_hotels = df_hotels.drop(h_idx).reset_index(drop=True)
-                            save_sheet_df("住宿飯店", df_hotels, HOTEL_COLS)
-                            st.success("✅ 已刪除此間飯店！")
+        # ==========================================
+        # 下半部：收合式新增與編輯管理區（不干擾檢視清爽度）
+        # ==========================================
+        add_fl_col, add_ht_col = st.columns(2)
+
+        with add_fl_col:
+            with st.expander("➕ 新增機票航班（去程 / 回程 / 轉機）", expanded=df_flights.empty):
+                with st.form("add_flight_form", clear_on_submit=True):
+                    f_leg = st.selectbox("航段類型 *", FLIGHT_LEG_OPTIONS)
+                    f_airline = st.text_input("航空公司 ＆ 航班編號 *", placeholder="例如：星宇航空 JX820 / 長榮 BR132")
+
+                    fc_d1, fc_d2, fc_d3 = st.columns([2.2, 1.5, 1.3])
+                    with fc_d1:
+                        f_dep_port = st.text_input("🛫 出發機場/航廈 *", placeholder="桃園 TPE T1")
+                    with fc_d2:
+                        f_dep_date = st.date_input("起飛日期 *", value=default_ci_date)
+                    with fc_d3:
+                        f_dep_time = st.time_input("起飛時間 *", value=datetime.time(8, 30), step=300)
+
+                    fc_a1, fc_a2, fc_a3 = st.columns([2.2, 1.5, 1.3])
+                    with fc_a1:
+                        f_arr_port = st.text_input("🛬 抵達機場/航廈 *", placeholder="關西 KIX T1")
+                    with fc_a2:
+                        f_arr_date = st.date_input("抵達日期 *", value=default_ci_date)
+                    with fc_a3:
+                        f_arr_time = st.time_input("抵達時間 *", value=datetime.time(12, 10), step=300)
+
+                    f_note = st.text_input("📝 訂位代號 / 行李額度（選填）", placeholder="例如：訂位代號 ABC123、託運 23kg")
+
+                    if st.form_submit_button("✅ 儲存航班資訊", type="primary", use_container_width=True):
+                        if not f_airline.strip() or not f_dep_port.strip() or not f_arr_port.strip():
+                            st.warning("⚠️ 請完整填寫「航空公司與班次」、「出發機場」與「抵達機場」喔！")
+                        else:
+                            new_f = pd.DataFrame([{
+                                "航段類型": f_leg,
+                                "航空與班次": f_airline.strip(),
+                                "出發機場航廈": f_dep_port.strip(),
+                                "起飛日期": f_dep_date.isoformat(),
+                                "起飛時間": f_dep_time.strftime("%H:%M"),
+                                "抵達機場航廈": f_arr_port.strip(),
+                                "抵達日期": f_arr_date.isoformat(),
+                                "抵達時間": f_arr_time.strftime("%H:%M"),
+                                "訂位與行李備註": f_note.strip(),
+                                "新增者": current_user
+                            }])
+                            df_flights = pd.concat([df_flights, new_f], ignore_index=True)
+                            save_sheet_df("機票航班", df_flights, FLIGHT_COLS)
+                            st.success(f"✅ 已新增航班「{f_airline.strip()}」！")
                             st.rerun()
 
-                with st.expander(f"✏️ 修改「{h_row['飯店名稱']}」的日期、時間或備註"):
+        with add_ht_col:
+            with st.expander("➕ 新增住宿飯店（支援單間或多間換飯店）", expanded=df_hotels.empty):
+                with st.form("add_hotel_form", clear_on_submit=True):
+                    h_name = st.text_input("🏨 飯店名稱 *", placeholder="例如：難波東方酒店 / 阪急龍仕柏飯店")
+                    h_url = st.text_input("🔗 Google Maps 網址或訂房連結（選填）", placeholder="https://maps.app.goo.gl/...")
+
+                    hc_i1, hc_i2 = st.columns([1.6, 1.4])
+                    with hc_i1:
+                        h_ci_date = st.date_input("📅 入住日期 *", value=default_ci_date)
+                    with hc_i2:
+                        h_ci_time = st.time_input("🕒 入住時間 *", value=datetime.time(15, 0), step=900)
+
+                    hc_o1, hc_o2 = st.columns([1.6, 1.4])
+                    with hc_o1:
+                        h_co_date = st.date_input("📅 退房日期 *", value=default_co_date)
+                    with hc_o2:
+                        h_co_time = st.time_input("🕚 退房時間 *", value=datetime.time(11, 0), step=900)
+
+                    h_note = st.text_input("📝 訂房代號 / 備註（選填）", placeholder="例如：Agoda #123456、可寄放行李")
+
+                    if st.form_submit_button("✅ 儲存飯店資訊", type="primary", use_container_width=True):
+                        if not h_name.strip():
+                            st.warning("⚠️ 請輸入飯店名稱喔！")
+                        elif h_co_date < h_ci_date:
+                            st.error("❌ 退房日期不能早於入住日期喔！")
+                        else:
+                            with st.spinner("🔍 正在解析飯店座標與最近車站..."):
+                                _, resolved_sub = resolve_place_and_subway(h_url.strip(), h_name.strip(), "", h_note.strip())
+
+                            new_h = pd.DataFrame([{
+                                "飯店名稱": h_name.strip(),
+                                "網址": h_url.strip(),
+                                "入住日期": h_ci_date.isoformat(),
+                                "入住時間": h_ci_time.strftime("%H:%M"),
+                                "退房日期": h_co_date.isoformat(),
+                                "退房時間": h_co_time.strftime("%H:%M"),
+                                "最近車站": resolved_sub,
+                                "訂房備註": h_note.strip(),
+                                "新增者": current_user
+                            }])
+                            df_hotels = pd.concat([df_hotels, new_h], ignore_index=True)
+                            save_sheet_df("住宿飯店", df_hotels, HOTEL_COLS)
+                            st.success(f"✅ 已新增飯店「{h_name.strip()}」！")
+                            st.rerun()
+
+        if not df_flights.empty or not df_hotels.empty:
+            with st.expander("✏️ 修改或刪除已登錄的機票 / 住宿"):
+                if not df_flights.empty:
+                    st.markdown("**✈️ 管理機票航班**")
+                    f_opts = [f"[{i}] {r['航段類型']}｜{r['航空與班次']}（{r['起飛日期']} {r['起飛時間']}）" for i, r in df_flights.iterrows()]
+                    sel_f_lbl = st.selectbox("選擇要編輯或刪除的航班：", f_opts)
+                    f_idx = int(sel_f_lbl.split("]")[0].replace("[", ""))
+                    f_row = df_flights.loc[f_idx]
+
+                    with st.form(f"edit_flight_form_{f_idx}"):
+                        ef1, ef2 = st.columns([1.8, 3.2])
+                        with ef1:
+                            cur_leg_idx = FLIGHT_LEG_OPTIONS.index(f_row["航段類型"]) if f_row["航段類型"] in FLIGHT_LEG_OPTIONS else 0
+                            ed_f_leg = st.selectbox("航段類型", FLIGHT_LEG_OPTIONS, index=cur_leg_idx)
+                        with ef2:
+                            ed_f_airline = st.text_input("航空公司 ＆ 航班編號", value=str(f_row["航空與班次"]))
+
+                        ef3, ef4, ef5 = st.columns([2.5, 1.5, 1.2])
+                        try:
+                            cur_dep_d = datetime.date.fromisoformat(str(f_row["起飛日期"]).strip())
+                        except Exception:
+                            cur_dep_d = default_ci_date
+                        try:
+                            dh, dm = map(int, str(f_row["起飛時間"]).split(":")[:2])
+                            cur_dep_t = datetime.time(dh, dm)
+                        except Exception:
+                            cur_dep_t = datetime.time(8, 30)
+
+                        with ef3:
+                            ed_f_dep_port = st.text_input("出發機場 / 航廈", value=str(f_row["出發機場航廈"]))
+                        with ef4:
+                            ed_f_dep_d = st.date_input("起飛日期", value=cur_dep_d)
+                        with ef5:
+                            ed_f_dep_t = st.time_input("起飛時間", value=cur_dep_t, step=300)
+
+                        ef6, ef7, ef8 = st.columns([2.5, 1.5, 1.2])
+                        try:
+                            cur_arr_d = datetime.date.fromisoformat(str(f_row["抵達日期"]).strip())
+                        except Exception:
+                            cur_arr_d = default_ci_date
+                        try:
+                            ah, am = map(int, str(f_row["抵達時間"]).split(":")[:2])
+                            cur_arr_t = datetime.time(ah, am)
+                        except Exception:
+                            cur_arr_t = datetime.time(12, 0)
+
+                        with ef6:
+                            ed_f_arr_port = st.text_input("抵達機場 / 航廈", value=str(f_row["抵達機場航廈"]))
+                        with ef7:
+                            ed_f_arr_d = st.date_input("抵達日期", value=cur_arr_d)
+                        with ef8:
+                            ed_f_arr_t = st.time_input("抵達時間", value=cur_arr_t, step=300)
+
+                        ed_f_note = st.text_input("訂位與行李備註", value=str(f_row["訂位與行李備註"]))
+
+                        fb1, fb2 = st.columns([2, 1])
+                        with fb1:
+                            save_f_btn = st.form_submit_button("💾 儲存航班修改", type="primary", use_container_width=True)
+                        with fb2:
+                            del_f_btn = st.form_submit_button("🗑️ 刪除此航班", type="secondary", use_container_width=True)
+
+                        if save_f_btn:
+                            df_flights.at[f_idx, "航段類型"] = ed_f_leg
+                            df_flights.at[f_idx, "航空與班次"] = ed_f_airline.strip()
+                            df_flights.at[f_idx, "出發機場航廈"] = ed_f_dep_port.strip()
+                            df_flights.at[f_idx, "起飛日期"] = ed_f_dep_d.isoformat()
+                            df_flights.at[f_idx, "起飛時間"] = ed_f_dep_t.strftime("%H:%M")
+                            df_flights.at[f_idx, "抵達機場航廈"] = ed_f_arr_port.strip()
+                            df_flights.at[f_idx, "抵達日期"] = ed_f_arr_d.isoformat()
+                            df_flights.at[f_idx, "抵達時間"] = ed_f_arr_t.strftime("%H:%M")
+                            df_flights.at[f_idx, "訂位與行李備註"] = ed_f_note.strip()
+                            save_sheet_df("機票航班", df_flights, FLIGHT_COLS)
+                            st.success("✅ 航班資訊已更新！")
+                            st.rerun()
+
+                        if del_f_btn:
+                            df_flights = df_flights.drop(f_idx).reset_index(drop=True)
+                            save_sheet_df("機票航班", df_flights, FLIGHT_COLS)
+                            st.success("✅ 已刪除此筆航班！")
+                            st.rerun()
+
+                if not df_flights.empty and not df_hotels.empty:
+                    st.divider()
+
+                if not df_hotels.empty:
+                    st.markdown("**🏨 管理住宿飯店**")
+                    h_opts = [f"[{i}] {r['飯店名稱']}（{r['入住日期']} ～ {r['退房日期']}）" for i, r in df_hotels.iterrows()]
+                    sel_h_lbl = st.selectbox("選擇要編輯或刪除的飯店：", h_opts)
+                    h_idx = int(sel_h_lbl.split("]")[0].replace("[", ""))
+                    h_row = df_hotels.loc[h_idx]
+
                     with st.form(f"edit_hotel_form_{h_idx}"):
                         eh1, eh2 = st.columns([3, 3])
                         with eh1:
@@ -1889,8 +2102,8 @@ if st.session_state["workspace_area"] == "shared":
                             cur_ci_d = datetime.date.fromisoformat(str(h_row["入住日期"]).strip())
                             cur_co_d = datetime.date.fromisoformat(str(h_row["退房日期"]).strip())
                         except Exception:
-                            cur_ci_d = datetime.date.today()
-                            cur_co_d = datetime.date.today() + timedelta(days=1)
+                            cur_ci_d = default_ci_date
+                            cur_co_d = default_co_date
 
                         try:
                             ci_h, ci_m = map(int, str(h_row["入住時間"]).split(":")[:2])
@@ -1916,7 +2129,13 @@ if st.session_state["workspace_area"] == "shared":
                         e_h_note = st.text_input("訂房備註", value=str(h_row["訂房備註"]))
                         recheck_h_sub = st.checkbox("🔄 儲存時重新反查最近車站")
 
-                        if st.form_submit_button("💾 儲存飯店修改", type="primary"):
+                        hb1, hb2 = st.columns([2, 1])
+                        with hb1:
+                            save_h_btn = st.form_submit_button("💾 儲存飯店修改", type="primary", use_container_width=True)
+                        with hb2:
+                            del_h_btn = st.form_submit_button("🗑️ 刪除此飯店", type="secondary", use_container_width=True)
+
+                        if save_h_btn:
                             if e_co_d < e_ci_d:
                                 st.error("❌ 退房日期不能早於入住日期喔！")
                             else:
@@ -1935,6 +2154,12 @@ if st.session_state["workspace_area"] == "shared":
                                 save_sheet_df("住宿飯店", df_hotels, HOTEL_COLS)
                                 st.success("✅ 飯店資訊已更新！")
                                 st.rerun()
+
+                        if del_h_btn:
+                            df_hotels = df_hotels.drop(h_idx).reset_index(drop=True)
+                            save_sheet_df("住宿飯店", df_hotels, HOTEL_COLS)
+                            st.success("✅ 已刪除此間飯店！")
+                            st.rerun()
 
     # --- 分頁：🗺️ 互動地圖總覽 ---
     with tab_map["map"]:
@@ -2909,12 +3134,12 @@ if st.session_state["workspace_area"] == "shared":
 
     # --- 分頁：📊 匯出精美 Excel ---
     with tab_map["excel"]:
-        st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、智慧判定商圈分區並依區域上色分類，產生包含「住宿飯店表」、「每日行程表」、「共用筆記整理」、「總表」與各分類分頁的 Excel 檔案。")
-        if df_links.empty and df_itin.empty and df_hotels.empty and df_notes.empty:
+        st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、智慧判定商圈分區並依區域上色分類，產生包含「機票航班表」、「住宿飯店表」、「每日行程表」、「共用筆記整理」、「總表」與各分類分頁的 Excel 檔案。")
+        if df_links.empty and df_itin.empty and df_hotels.empty and df_flights.empty and df_notes.empty:
             st.info("目前沒有資料可以匯出喔！")
         else:
             if st.button("🚀 開始統整並產生 Excel", type="primary"):
-                excel_data = generate_styled_excel(df_links.copy(), df_itin.copy(), df_hotels.copy(), df_notes.copy())
+                excel_data = generate_styled_excel(df_links.copy(), df_itin.copy(), df_hotels.copy(), df_flights.copy(), df_notes.copy())
                 ts = datetime.datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S")
                 st.session_state["excel_bytes"] = excel_data
                 st.session_state["excel_filename"] = f"大阪旅遊統整表_{ts}.xlsx"
