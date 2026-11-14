@@ -46,7 +46,7 @@ CAT_COLOR_RGBA = {
     "購物": [155, 89, 182, 235],        # 亮紫色
     "景點與地標": [39, 174, 96, 235],   # 翠綠色
     "交通/住宿": [41, 128, 185, 235],   # 寶藍色
-    "住宿飯店": [241, 196, 15, 245],    # 金黃色（飯店專屬醒目標記）
+    "住宿飯店": [241, 196, 15, 245],    # 金黃色
     "未分類": [127, 140, 141, 235]      # 鐵灰色
 }
 
@@ -98,6 +98,80 @@ BRANCH_INDICATORS = [
     "淀屋橋", "本町", "堀江", "美國村", "環球", "天保山", "海遊館", "大阪城",
     "勝尾寺", "箕面", "京都", "神戶", "奈良", "堺", "吹田", "枚方", "高槻", "臨空", "桜塚"
 ]
+
+# ==========================================
+# 自動智慧分區判定引擎（座標圍欄 ＋ 車站與關鍵字）
+# ==========================================
+def classify_kansai_region(lat=None, lon=None, name="", station_text="", note=""):
+    combined_text = f"{name} {station_text} {note}"
+
+    # 1. 優先使用精準經緯度地理圍欄判定
+    if lat is not None and lon is not None:
+        # 京都府（緯度高於 34.85）
+        if lat >= 34.85:
+            return "京都/神戶/奈良"
+        # 神戶 / 兵庫方向（經度低於 135.33）
+        if lon <= 135.33:
+            return "京都/神戶/奈良"
+        # 奈良方向（經度高於 135.68）
+        if lon >= 135.68:
+            return "京都/神戶/奈良"
+
+        # 環球影城 / 天保山 / 港區 / 夢洲舞洲（大阪灣沿岸）
+        if (34.630 <= lat <= 34.685) and (135.380 <= lon <= 135.468):
+            return "環球影城/港區"
+
+        # 梅田 / 大阪站 / 北新地 / 中崎町 / 福島 / 中之島北側
+        if (34.691 <= lat <= 34.718) and (135.475 <= lon <= 135.522):
+            return "梅田"
+
+        # 難波 / 心齋橋 / 道頓堀 / 日本橋 / 黑門 / 堀江 / 美國村 / 四橋 / 長堀橋 / 堺筋本町南側
+        if (34.656 <= lat <= 34.684) and (135.485 <= lon <= 135.516):
+            return "難波/心齋橋"
+
+        # 天王寺 / 阿倍野 / 新世界 / 通天閣 / 動物園前 / 恵美須町
+        if (34.638 <= lat <= 34.658) and (135.495 <= lon <= 135.528):
+            return "天王寺/阿倍野"
+
+    # 2. 次優先：根據最近車站名稱與店名/備註關鍵字判定
+    kyoto_kobe_nara_kw = [
+        "京都", "嵐山", "伏見", "宇治", "祇園", "河原町", "清水寺", "金閣寺", "錦市場",
+        "神戶", "神戸", "三宮", "元町", "有馬", "姬路", "姫路", "明石", "淡路",
+        "奈良", "近鐵奈良", "東大寺", "春日大社", "生駒"
+    ]
+    if any(k in combined_text for k in kyoto_kobe_nara_kw):
+        return "京都/神戶/奈良"
+
+    usj_bay_kw = [
+        "環球", "USJ", "ユニバーサル", "櫻島", "桜島", "天保山", "海遊館", "大阪港",
+        "弁天町", "朝潮橋", "宇宙廣場", "コスモスクエア", "南港", "夢洲", "舞洲", "港區", "港区"
+    ]
+    if any(k in combined_text for k in usj_bay_kw):
+        return "環球影城/港區"
+
+    umeda_kw = [
+        "梅田", "大阪站", "大阪駅", "北新地", "東梅田", "西梅田", "中崎町",
+        "中津", "福島", "新福島", "大江橋", "渡邊橋", "渡辺橋", "茶屋町", "LUCUA", "GRAND FRONT", "HEP FIVE"
+    ]
+    if any(k in combined_text for k in umeda_kw):
+        return "梅田"
+
+    namba_shinsaibashi_kw = [
+        "難波", "なんば", "心齋橋", "心斎橋", "道頓堀", "日本橋", "近鐵日本橋",
+        "黑門", "黒門", "堀江", "四橋", "四ツ橋", "長堀橋", "美國村", "アメリカ村",
+        "千日前", "宗右衛門町", "法善寺", "南海難波", "JR難波", "大阪難波", "湊町", "櫻川", "桜川", "大國町", "大国町"
+    ]
+    if any(k in combined_text for k in namba_shinsaibashi_kw):
+        return "難波/心齋橋"
+
+    tennoji_kw = [
+        "天王寺", "阿倍野", "あべの", "新世界", "通天閣", "動物園前", "恵美須町",
+        "新今宮", "寺田町", "四天王寺", "HARUKAS", "ハルカス", "Q's MALL"
+    ]
+    if any(k in combined_text for k in tennoji_kw):
+        return "天王寺/阿倍野"
+
+    return "其他/未指定"
 
 def build_map_marker_layer(df_points, marker_style, is_day_route=False):
     if marker_style.startswith("📍"):
@@ -246,7 +320,6 @@ def save_trip_dates(start_date, end_date):
     save_sheet_df(ws_meta, df_meta, META_COLS)
 
 def get_hotel_events_for_date(df_hotels, target_date):
-    """根據指定日期，找出當日退房、當日入住、或當晚續住的飯店資訊"""
     checkouts = []
     checkins = []
     staying = []
@@ -564,15 +637,15 @@ def query_google_places_new(place_name, region="", note=""):
         return None, None, "", "未設定 google_maps_api_key"
 
     reg_first = region.split("/")[0] if (region and region != "其他/未指定") else ""
-    area_prefix = reg_first if reg_first else "大阪"
+    area_prefix = reg_first if reg_first else ""
 
     clean_note = ""
     if note and not any(k in note for k in ["很多分店", "多家分店", "燒肉店", "咖哩飯"]):
         clean_note = note.strip()[:25]
 
     text_query = f"{place_name} {area_prefix} {clean_note}".strip()
-    if not any(k in text_query for k in ["大阪", "京都", "神戶", "奈良", "Osaka", "Kyoto", "関西", "關西"]):
-        text_query = f"大阪 {text_query}"
+    if not any(k in text_query for k in ["大阪", "京都", "神戶", "神戸", "奈良", "Osaka", "Kyoto", "Kobe", "Nara", "関西", "關西"]):
+        text_query = f"関西 {text_query}"
 
     try:
         res = requests.post(
@@ -739,6 +812,12 @@ def resolve_place_and_subway(url, custom_name="", region="", note=""):
     title, subway_info, _, _, _, _ = resolve_place_full(url, custom_name, region, note)
     return title, subway_info
 
+def resolve_place_subway_and_region(url, custom_name="", note=""):
+    """一次解析地點標題、最近車站與自動智慧分區"""
+    title, subway_info, lat, lon, _, _ = resolve_place_full(url, custom_name, "", note)
+    auto_reg = classify_kansai_region(lat=lat, lon=lon, name=title, station_text=subway_info, note=note)
+    return title, subway_info, auto_reg
+
 def calc_haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -807,7 +886,7 @@ def generate_styled_excel(df_links, df_itin=None, df_hotels=None):
     food_list, shop_list, spot_list, other_list = [], [], [], []
     sheet_updated = False
 
-    progress_bar = st.progress(0, text="🔍 正在透過 Google API 解析座標與最近車站...")
+    progress_bar = st.progress(0, text="🔍 正在透過 Google API 解析座標、智慧分區與最近車站...")
     total_rows = max(1, len(df_links))
 
     for index, row in df_links.iterrows():
@@ -822,8 +901,8 @@ def generate_styled_excel(df_links, df_itin=None, df_hotels=None):
         subway_info = str(row["最近地鐵站"]).strip()
 
         need_retry = (not subway_info) or subway_info.startswith(("查無", "未取得", "地鐵查詢逾時", "車站查詢逾時", "非地圖連結", "⚠️"))
-        if (not cached_title and not custom_name) or need_retry:
-            resolved_title, resolved_subway = resolve_place_and_subway(url, custom_name, region, note)
+        if (not cached_title and not custom_name) or need_retry or (not region) or (region == "其他/未指定"):
+            resolved_title, resolved_subway, auto_reg = resolve_place_subway_and_region(url, custom_name or cached_title, note)
             final_title = custom_name if custom_name else (cached_title if cached_title else resolved_title)
             if not cached_title:
                 df_links.at[index, "自動抓取標題"] = final_title
@@ -832,12 +911,16 @@ def generate_styled_excel(df_links, df_itin=None, df_hotels=None):
                 subway_info = resolved_subway
                 df_links.at[index, "最近地鐵站"] = subway_info
                 sheet_updated = True
+            if auto_reg != "其他/未指定" and auto_reg != region:
+                region = auto_reg
+                df_links.at[index, "區域"] = region
+                sheet_updated = True
         else:
             final_title = custom_name if custom_name else cached_title
 
         title_search = final_title
-        if not any(k in title_search.lower() for k in ["大阪", "osaka"]):
-            title_search = f"大阪 {title_search}"
+        if not any(k in title_search.lower() for k in ["大阪", "京都", "神戶", "奈良", "osaka", "kyoto", "kobe", "nara"]):
+            title_search = f"関西 {title_search}"
 
         gmap_query = urllib.parse.quote(title_search)
         gmap_url = f"https://www.google.com/maps/search/?api=1&query={gmap_query}"
@@ -1085,7 +1168,7 @@ if st.session_state["workspace_area"] is None:
             * 📅 **每日行程排程器 ＆ AI 顧問**：日曆排程、相鄰景點距離自動提示、AI 路線健檢
             * 🏨 **住宿飯店管理**：支援單間或多間換飯店、入住/退房詳細時間與全站自動連動
             * 🗺️ **全景點互動地圖總覽**：支援小圓點 / 地圖圖釘切換，檢視景點、飯店與單日動線
-            * 📋 **共用旅遊清單**：瀏覽所有美食、購物、景點與最近車站
+            * 📋 **共用旅遊清單**：自動智慧判定商圈分區（難波/梅田/港區/京阪神奈等）與最近車站
             * 🧭 **路線與距離試算**：一鍵套用已訂飯店雙向路線、任意兩定點對比
             * 💰 **共同支出＆分帳計算機**：記錄代墊款項，即時匯率合併結算誰給誰錢
             * 📊 **匯出精美 Excel**：含住宿飯店表、每日行程表與各分類上色分頁
@@ -1354,7 +1437,6 @@ if st.session_state["workspace_area"] == "shared":
                         date_label = group.iloc[0]["日期"]
                         st.markdown(f"### 🗓️ {day_tag} ｜ {date_label}")
 
-                        # 自動顯示當日住宿飯店動態橫幅（退房、入住、今晚續住）
                         cur_date_obj = day_date_obj_map.get(day_tag)
                         if cur_date_obj and not df_hotels.empty:
                             co_list, ci_list, stay_list = get_hotel_events_for_date(df_hotels, cur_date_obj)
@@ -1405,7 +1487,7 @@ if st.session_state["workspace_area"] == "shared":
                                             st.rerun()
 
                         places_for_route = [
-                            urllib.parse.quote(f"大阪 {str(row['行程名稱']).replace('🏨 飯店退房：', '').replace('🔑 飯店入住：', '').strip()}")
+                            urllib.parse.quote(f"関西 {str(row['行程名稱']).replace('🏨 飯店退房：', '').replace('🔑 飯店入住：', '').strip()}")
                             for _, row in group.iterrows()
                         ]
                         if len(places_for_route) >= 2:
@@ -1652,7 +1734,7 @@ if st.session_state["workspace_area"] == "shared":
                     with hc_right:
                         gmap_h_url = str(h_row["網址"]).strip()
                         if not gmap_h_url.startswith("http"):
-                            q_h = urllib.parse.quote(f"大阪 {h_row['飯店名稱']}")
+                            q_h = urllib.parse.quote(f"関西 {h_row['飯店名稱']}")
                             gmap_h_url = f"https://www.google.com/maps/search/?api=1&query={q_h}"
                         st.link_button("📍 地圖導航", gmap_h_url, use_container_width=True)
 
@@ -1747,7 +1829,6 @@ if st.session_state["workspace_area"] == "shared":
                 horizontal=True
             )
 
-        # 模式 A：全部收藏景點 ＆ 住宿飯店總覽
         if map_mode.startswith("🌍"):
             if df_links.empty and df_hotels.empty:
                 st.info("目前共用清單與住宿飯店還沒有資料喔！")
@@ -1823,7 +1904,7 @@ if st.session_state["workspace_area"] == "shared":
                     )
 
                     tooltip = {
-                        "html": "<b>{name}</b><br/>🏷️ {category} ｜ 📅 {region}<br/>🚉 {station}<br/>📝 {note}",
+                        "html": "<b>{name}</b><br/>🏷️ {category} ｜ 🗺️ {region}<br/>🚉 {station}<br/>📝 {note}",
                         "style": {"backgroundColor": "#1e272e", "color": "white", "fontSize": "13px", "borderRadius": "8px", "padding": "8px"}
                     }
 
@@ -1837,7 +1918,6 @@ if st.session_state["workspace_area"] == "shared":
                     if unmapped_names:
                         st.caption(f"ℹ️ 以下地點因未指定分店或尚無座標，未顯示於地圖上：{', '.join(unmapped_names)}")
 
-        # 模式 B：單日行程動線連線模式
         else:
             if df_itin.empty:
                 st.info("目前「每日行程排程」還沒有資料，請先去第一個分頁排入行程喔！")
@@ -1932,13 +2012,45 @@ if st.session_state["workspace_area"] == "shared":
                         st.dataframe(pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
                         st.caption(f"🏁 {chosen_map_day} 全日累計直線移動距離：約 **{total_km:.2f} km**")
 
-    # --- 共用分頁 3：瀏覽共用清單 ---
+    # --- 共用分頁 3：瀏覽共用清單（含一鍵重新智慧自動分區） ---
     with tab1:
         if df_links.empty:
             st.info("目前清單空空如也，快切換到「➕ 新增連結」加入第一個大阪景點吧！")
         else:
-            btn_col1, btn_col2 = st.columns(2)
+            btn_col1, btn_col2, btn_col3 = st.columns(3)
             with btn_col1:
+                if st.button("🧭 一鍵智慧自動分區（重新整理所有景點分區）", type="primary", use_container_width=True):
+                    prog = st.progress(0, text="🧭 正在根據經緯度座標與最近車站重新判定分區...")
+                    changed_count = 0
+                    for i, idx in enumerate(df_links.index.tolist()):
+                        row = df_links.loc[idx]
+                        c_name = str(row["自訂名稱"]).strip() or str(row["自動抓取標題"]).strip()
+                        u_str = str(row["網址"]).strip()
+                        n_str = str(row["備註"]).strip()
+                        old_reg = str(row["區域"]).strip()
+
+                        res_title, res_sub, lat_v, lon_v, _, _ = resolve_place_full(
+                            url=u_str, custom_name=c_name, region="", note=n_str
+                        )
+                        final_t = c_name if c_name else res_title
+                        new_reg = classify_kansai_region(
+                            lat=lat_v, lon=lon_v, name=final_t, station_text=res_sub, note=n_str
+                        )
+
+                        if not str(row["自動抓取標題"]).strip():
+                            df_links.at[idx, "自動抓取標題"] = final_t
+                        if not str(row["最近地鐵站"]).strip() or str(row["最近地鐵站"]).startswith(("查無", "未取得", "⚠️")):
+                            df_links.at[idx, "最近地鐵站"] = res_sub
+                        if new_reg != old_reg:
+                            df_links.at[idx, "區域"] = new_reg
+                            changed_count += 1
+                        prog.progress((i + 1) / len(df_links))
+                    prog.empty()
+                    save_data(df_links)
+                    st.success(f"✅ 智慧分區完成！共自動更新了 **{changed_count}** 筆景點的區域分類。")
+                    st.rerun()
+
+            with btn_col2:
                 def needs_subway_lookup(val):
                     s = str(val).strip()
                     return (not s) or s.startswith(("查無", "未取得", "地鐵查詢逾時", "車站查詢逾時", "非地圖連結", "⏭️", "⚠️")) or ("JROsaka" in s)
@@ -1946,42 +2058,45 @@ if st.session_state["workspace_area"] == "shared":
                 retry_mask = df_links["最近地鐵站"].apply(needs_subway_lookup)
                 retry_count = int(retry_mask.sum())
                 if retry_count > 0:
-                    if st.button(f"🚇 修正/補查 {retry_count} 筆資料的最近車站", type="primary", use_container_width=True):
+                    if st.button(f"🚇 補查 {retry_count} 筆缺漏的最近車站", type="secondary", use_container_width=True):
                         prog = st.progress(0, text="🚇 正在透過 Google API 精準反查最近車站...")
                         retry_indices = df_links[retry_mask].index.tolist()
                         for i, idx in enumerate(retry_indices):
                             row = df_links.loc[idx]
                             c_name = str(row["自訂名稱"]).strip() or str(row["自動抓取標題"]).strip()
-                            resolved_title, resolved_subway = resolve_place_and_subway(
+                            resolved_title, resolved_subway, auto_reg = resolve_place_subway_and_region(
                                 str(row["網址"]).strip(),
                                 c_name,
-                                str(row["區域"]).strip(),
                                 str(row["備註"]).strip()
                             )
                             if not str(row["自動抓取標題"]).strip():
                                 df_links.at[idx, "自動抓取標題"] = c_name if c_name else resolved_title
                             df_links.at[idx, "最近地鐵站"] = resolved_subway
+                            if auto_reg != "其他/未指定":
+                                df_links.at[idx, "區域"] = auto_reg
                             prog.progress((i + 1) / len(retry_indices))
                         prog.empty()
                         save_data(df_links)
-                        st.success("✅ 已完成車站與步行時間更新！")
+                        st.success("✅ 已完成車站與分區更新！")
                         st.rerun()
+                else:
+                    st.button("✅ 所有景點車站皆已解析", disabled=True, use_container_width=True)
 
-            with btn_col2:
-                if st.button("🔄 全部重新查詢最近車站（地鐵+電鐵）", type="secondary", use_container_width=True):
-                    prog = st.progress(0, text="🚇 正在全部重新解析座標與最近車站...")
+            with btn_col3:
+                if st.button("🔄 全部重新查詢車站與分區", type="secondary", use_container_width=True):
+                    prog = st.progress(0, text="🚇 正在全部重新解析座標、車站與分區...")
                     for i, idx in enumerate(df_links.index.tolist()):
                         row = df_links.loc[idx]
                         c_name = str(row["自訂名稱"]).strip() or str(row["自動抓取標題"]).strip()
-                        resolved_title, resolved_subway = resolve_place_and_subway(
+                        resolved_title, resolved_subway, auto_reg = resolve_place_subway_and_region(
                             str(row["網址"]).strip(),
                             c_name,
-                            str(row["區域"]).strip(),
                             str(row["備註"]).strip()
                         )
                         if not str(row["自動抓取標題"]).strip():
                             df_links.at[idx, "自動抓取標題"] = c_name if c_name else resolved_title
                         df_links.at[idx, "最近地鐵站"] = resolved_subway
+                        df_links.at[idx, "區域"] = auto_reg
                         prog.progress((i + 1) / len(df_links))
                     prog.empty()
                     save_data(df_links)
@@ -2241,20 +2356,20 @@ if st.session_state["workspace_area"] == "shared":
                             }
                         )
 
-    # --- 共用分頁 5：新增連結 ---
+    # --- 共用分頁 5：新增連結（全自動智慧分區，免手動選區域） ---
     with tab3:
         with st.form("add_link_form", clear_on_submit=True):
             st.subheader("新增景點 / 餐廳 / 購物連結")
+            st.caption("✨ 貼上網址或輸入店名後，系統會透過 Google API 自動定位座標、反查最近車站，並**自動判斷所屬商圈分區**！")
             raw_input = st.text_input("🔗 貼上網址（支援 Google Maps、IG、食記或一般網頁）*", placeholder="https://...")
-            c_name = st.text_input("✏️ 自訂中文/日文名稱（選填；系統會透過 Google API 自動搜尋地址與最近車站）", placeholder="例如：一蘭拉麵 道頓堀店")
+            c_name = st.text_input("✏️ 自訂中文/日文名稱（選填；若貼 IG 或食記建議填寫店名，系統會自動搜尋座標與分區）", placeholder="例如：一蘭拉麵 道頓堀店")
 
-            c1, c2 = st.columns(2)
+            c1, c2 = st.columns([2, 3])
             with c1:
                 chosen_cat = st.selectbox("🏷️ 主分類", CAT_OPTIONS)
             with c2:
-                chosen_region = st.selectbox("🗺️ 區域 / 商圈", REGION_OPTIONS)
+                note_text = st.text_input("📝 備註（選填）", placeholder="例如：OPA百貨 五樓、必點牛舌")
 
-            note_text = st.text_input("📝 備註（選填）", placeholder="例如：OPA百貨 五樓、必點牛舌")
             submitted = st.form_submit_button(f"✅ 以【{current_user}】身分加入共用清單", type="primary")
 
             if submitted:
@@ -2283,18 +2398,17 @@ if st.session_state["workspace_area"] == "shared":
                             dup_name = dup_row["自訂名稱"] if str(dup_row["自訂名稱"]).strip() else "(無自訂名稱)"
                             st.warning(f"⚠️ 此網址已存在清單中！（名稱：{dup_name} ｜ 推薦人：{dup_row['新增者']} 於 {dup_row['新增時間']} 新增）")
                         else:
-                            with st.spinner("🔍 正在透過 Google API 解析地點座標並計算最近車站與步行時間..."):
-                                fetched_title, subway_result = resolve_place_and_subway(
+                            with st.spinner("🔍 正在透過 Google API 解析地點座標、最近車站並自動判定商圈分區..."):
+                                fetched_title, subway_result, auto_region = resolve_place_subway_and_region(
                                     extracted_url,
                                     c_name.strip(),
-                                    chosen_region,
                                     note_text.strip()
                                 )
 
                             new_row = pd.DataFrame([{
                                 "網址": extracted_url,
                                 "分類": chosen_cat,
-                                "區域": chosen_region,
+                                "區域": auto_region,
                                 "自訂名稱": c_name.strip(),
                                 "自動抓取標題": fetched_title,
                                 "最近地鐵站": subway_result,
@@ -2304,7 +2418,7 @@ if st.session_state["workspace_area"] == "shared":
                             }])
                             df_updated = pd.concat([df_links, new_row], ignore_index=True)
                             save_data(df_updated)
-                            st.success(f"✅ 新增成功！「{fetched_title}」｜{subway_result}")
+                            st.success(f"✅ 新增成功！「{fetched_title}」｜自動分區：【{auto_region}】｜{subway_result}")
                             st.rerun()
 
     # --- 共用分頁 6：修改 / 刪除 ---
@@ -2330,10 +2444,10 @@ if st.session_state["workspace_area"] == "shared":
                     edit_cat = st.selectbox("🏷️ 主分類", CAT_OPTIONS, index=cat_idx)
                 with ec2:
                     reg_idx = REGION_OPTIONS.index(target_row["區域"]) if target_row["區域"] in REGION_OPTIONS else 5
-                    edit_region = st.selectbox("🗺️ 區域 / 商圈", REGION_OPTIONS, index=reg_idx)
+                    edit_region = st.selectbox("🗺️ 區域 / 商圈（若勾選下方重新反查將自動更新）", REGION_OPTIONS, index=reg_idx)
 
                 edit_subway = st.text_input("🚇 最近車站（可手動填寫，或勾選下方重新反查）", value=str(target_row["最近地鐵站"]))
-                recheck_subway = st.checkbox("🔄 儲存時重新反查最近車站（地鐵+電鐵）")
+                recheck_subway = st.checkbox("🔄 儲存時重新反查最近車站與自動分區")
                 edit_note = st.text_input("📝 備註", value=str(target_row["備註"]))
 
                 save_edit = st.form_submit_button("💾 儲存修改", type="primary")
@@ -2342,23 +2456,24 @@ if st.session_state["workspace_area"] == "shared":
                     new_name = edit_name.strip()
 
                     if recheck_subway:
-                        resolved_title, resolved_subway = resolve_place_and_subway(
+                        resolved_title, resolved_subway, auto_reg = resolve_place_subway_and_region(
                             clean_url,
                             new_name,
-                            edit_region,
                             edit_note.strip()
                         )
                         df_links.at[target_idx, "自動抓取標題"] = new_name if new_name else resolved_title
                         final_subway = resolved_subway
+                        final_region = auto_reg
                     else:
                         if new_name != str(target_row["自訂名稱"]).strip():
                             df_links.at[target_idx, "自動抓取標題"] = new_name if new_name else str(target_row["自動抓取標題"])
                         final_subway = edit_subway.strip()
+                        final_region = edit_region
 
                     df_links.at[target_idx, "網址"] = clean_url
                     df_links.at[target_idx, "自訂名稱"] = new_name
                     df_links.at[target_idx, "分類"] = edit_cat
-                    df_links.at[target_idx, "區域"] = edit_region
+                    df_links.at[target_idx, "區域"] = final_region
                     df_links.at[target_idx, "最近地鐵站"] = final_subway
                     df_links.at[target_idx, "備註"] = edit_note.strip()
                     df_links.at[target_idx, "新增者"] = current_user
@@ -2535,7 +2650,7 @@ if st.session_state["workspace_area"] == "shared":
 
     # --- 共用分頁 8：匯出精美 Excel ---
     with tab6:
-        st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、依區域上色分類，並產生包含「住宿飯店表」、「每日行程表」、「總表」與各分類分頁的 Excel 檔案。")
+        st.write("點擊下方按鈕，系統會自動補查尚未解析的最近車站（地鐵/電鐵）、智慧判定商圈分區並依區域上色分類，產生包含「住宿飯店表」、「每日行程表」、「總表」與各分類分頁的 Excel 檔案。")
         if df_links.empty and df_itin.empty and df_hotels.empty:
             st.info("目前沒有資料可以匯出喔！")
         else:
@@ -2566,7 +2681,6 @@ else:
         "🧳 個人行李打包清單"
     ])
 
-    # --- 私人分頁 1：🛍️ 私人購物 ＆ 代購清單 ---
     with ptab1:
         ws_shop = get_or_create_ws("私人購物清單", SHOPPING_COLS)
         df_shop_all = load_sheet_df(ws_shop, SHOPPING_COLS)
@@ -2679,7 +2793,6 @@ else:
                 st.success("✅ 私人購物清單已同步儲存！")
                 st.rerun()
 
-    # --- 私人分頁 2：🧳 個人行李打包清單 ---
     with ptab2:
         ws_pack = get_or_create_ws("個人行李清單", PACKING_COLS)
         df_pack_all = load_sheet_df(ws_pack, PACKING_COLS)
